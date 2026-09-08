@@ -128,8 +128,12 @@ size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
   }
   size_t input_count = available - reserve;
   /* samples is bounded by the allocated ring capacity above, so doubling it
-   * cannot overflow a valid allocation. */
+   * cannot overflow a valid allocation. Tiny test or scheduler callbacks
+   * still need enough source history for the persistent sinc converter. */
   size_t maximum_input = samples * 2;
+  if (maximum_input < 256) {
+    maximum_input = 256;
+  }
   if (input_count > maximum_input)
     input_count = maximum_input;
   for (size_t i = 0; i < input_count; ++i)

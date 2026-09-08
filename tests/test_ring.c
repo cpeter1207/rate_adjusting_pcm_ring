@@ -111,6 +111,13 @@ int main(void) {
   assert(rpcr_render(&ring, output, 160, 0, 1));
   assert(processed_input_frames == 160);
   rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  rpcr_write(&ring, input, 1024);
+  int16_t tiny_output[2];
+  processed_input_frames = 0;
+  (void)rpcr_render(&ring, tiny_output, 2, 0, 1);
+  assert(processed_input_frames == 256);
+  rpcr_destroy(&ring);
   puts("rate-adjusting PCM ring tests passed");
   return 0;
 }
