@@ -8,7 +8,11 @@ SOURCE := src/rate_adjusting_pcm_ring.c
 HEADER := include/rate_adjusting_pcm_ring.h
 TEST := tests/test_ring.c
 CONSUMER_TEST := tests/test_consumer.c
-VERSION := 0.1.0-dev
+VERSION ?= 0.1.0-dev
+LIB_VERSION := $(VERSION)
+LIB_SOVERSION := $(word 1,$(subst ., ,$(LIB_VERSION)))
+LIB_SHARED := build/librate_adjusting_pcm_ring.so.$(LIB_VERSION)
+LIB_SONAME := build/librate_adjusting_pcm_ring.so.$(LIB_SOVERSION)
 prefix ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(prefix)/lib
@@ -16,18 +20,18 @@ PC_TEMPLATE := rate_adjusting_pcm_ring.pc.in
 PC_FILE := build/rate_adjusting_pcm_ring.pc
 
 .PHONY: all quality lint static-analysis docs test coverage install install-check distcheck platform-verify ci clean
-all: build/librate_adjusting_pcm_ring.a build/librate_adjusting_pcm_ring.so.0.1.0 build/librate_adjusting_pcm_ring.so.0 build/librate_adjusting_pcm_ring.so
+all: build/librate_adjusting_pcm_ring.a $(LIB_SHARED) $(LIB_SONAME) build/librate_adjusting_pcm_ring.so
 build:
 	mkdir -p $@
 build/rate_adjusting_pcm_ring.o: $(SOURCE) $(HEADER) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -fPIC -c $< -o $@
 build/librate_adjusting_pcm_ring.a: build/rate_adjusting_pcm_ring.o
 	$(AR) rcs $@ $^
-build/librate_adjusting_pcm_ring.so.0.1.0: build/rate_adjusting_pcm_ring.o
-	$(CC) -shared -Wl,-soname,librate_adjusting_pcm_ring.so.0 -o $@ $^ -lsamplerate
-build/librate_adjusting_pcm_ring.so.0: build/librate_adjusting_pcm_ring.so.0.1.0
+$(LIB_SHARED): build/rate_adjusting_pcm_ring.o
+	$(CC) -shared -Wl,-soname,librate_adjusting_pcm_ring.so.$(LIB_SOVERSION) -o $@ $^ -lsamplerate
+$(LIB_SONAME): $(LIB_SHARED)
 	ln -sf $(notdir $<) $@
-build/librate_adjusting_pcm_ring.so: build/librate_adjusting_pcm_ring.so.0
+build/librate_adjusting_pcm_ring.so: $(LIB_SONAME)
 	ln -sf $(notdir $<) $@
 $(PC_FILE): $(PC_TEMPLATE) | build
 	sed -e 's|@PREFIX@|$(prefix)|' -e 's|@LIBDIR@|$(LIBDIR)|' \
@@ -52,15 +56,15 @@ coverage: test
 install: all $(PC_FILE)
 	install -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(prefix)/include/rate_adjusting_pcm_ring $(DESTDIR)$(LIBDIR)/pkgconfig
 	install -m 0644 build/librate_adjusting_pcm_ring.a $(DESTDIR)$(LIBDIR)/
-	install -m 0755 build/librate_adjusting_pcm_ring.so.0.1.0 $(DESTDIR)$(LIBDIR)/
-	ln -sf librate_adjusting_pcm_ring.so.0.1.0 $(DESTDIR)$(LIBDIR)/librate_adjusting_pcm_ring.so.0
-	ln -sf librate_adjusting_pcm_ring.so.0 $(DESTDIR)$(LIBDIR)/librate_adjusting_pcm_ring.so
+	install -m 0755 $(LIB_SHARED) $(DESTDIR)$(LIBDIR)/
+	ln -sf $(notdir $(LIB_SHARED)) $(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SONAME))
+	ln -sf $(notdir $(LIB_SONAME)) $(DESTDIR)$(LIBDIR)/librate_adjusting_pcm_ring.so
 	install -m 0644 $(HEADER) $(DESTDIR)$(prefix)/include/rate_adjusting_pcm_ring/
 	install -m 0644 $(PC_FILE) $(DESTDIR)$(LIBDIR)/pkgconfig/
 install-check: all
 	$(MAKE) DESTDIR=$(CURDIR)/build/stage prefix=/usr install
 	cmp build/librate_adjusting_pcm_ring.a build/stage/usr/lib/librate_adjusting_pcm_ring.a
-	cmp build/librate_adjusting_pcm_ring.so.0.1.0 build/stage/usr/lib/librate_adjusting_pcm_ring.so.0.1.0
+	cmp $(LIB_SHARED) build/stage/usr/lib/$(notdir $(LIB_SHARED))
 	cmp $(HEADER) build/stage/usr/include/rate_adjusting_pcm_ring/rate_adjusting_pcm_ring.h
 	PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/build/stage $(CC) $(WARNINGS) $(CONSUMER_TEST) \
 		$$(PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/build/stage pkg-config --cflags --libs rate_adjusting_pcm_ring) \
