@@ -36,6 +36,15 @@ struct rpcr_ring {
       written; /**< Producer-owned monotonically increasing cursor. */
   atomic_uint_fast64_t
       read; /**< Consumer-owned monotonically increasing cursor. */
+  atomic_uint_fast64_t discarded; /**< Producer-observed overwritten samples. */
+  atomic_uint_fast64_t
+      missing; /**< Consumer-observed output shortfall samples. */
+  atomic_uint_fast64_t
+      consecutive_underruns; /**< Current contiguous output shortfall. */
+  atomic_uint_fast64_t
+      underrun_average_milli; /**< Ten-second shortfall EWMA. */
+  atomic_uint_fast64_t
+      reserve_samples; /**< Latest consumer-selected retained input reserve. */
   struct SRC_STATE_tag
       *converter; /**< Consumer-owned persistent libsamplerate state. */
   uint64_t occupancy_milli; /**< Consumer-owned filtered occupancy. */
@@ -84,5 +93,20 @@ void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples);
  */
 bool rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
                  size_t reserve, size_t target);
+
+/** @brief Return published PCM available to the consumer.
+ * @param ring Initialized ring.
+ * @return Readable sample count, bounded by capacity.
+ */
+size_t rpcr_available(const struct rpcr_ring *ring);
+
+/** @brief Update observable output-shortfall statistics after one callback.
+ * @param ring Initialized consumer-owned ring.
+ * @param missing PCM samples unavailable to the callback.
+ * @param samples Requested callback length.
+ * @param rate Callback sample rate in Hz for the ten-second EWMA window.
+ */
+void rpcr_record_shortfall(struct rpcr_ring *ring, size_t missing,
+                           size_t samples, unsigned int rate);
 
 #endif

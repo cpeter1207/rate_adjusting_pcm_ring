@@ -40,6 +40,13 @@ int rpcr_init(struct rpcr_ring *ring, size_t capacity,
     rpcr_destroy(ring);
     return -1;
   }
+  atomic_init(&ring->written, 0);
+  atomic_init(&ring->read, 0);
+  atomic_init(&ring->discarded, 0);
+  atomic_init(&ring->missing, 0);
+  atomic_init(&ring->consecutive_underruns, 0);
+  atomic_init(&ring->underrun_average_milli, 0);
+  atomic_init(&ring->reserve_samples, 0);
   return 0;
 }
 
@@ -55,14 +62,54 @@ void rpcr_destroy(struct rpcr_ring *ring) {
 
 void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples) {
   uint64_t written = atomic_load_explicit(&ring->written, memory_order_relaxed);
+  uint64_t read = atomic_load_explicit(&ring->read, memory_order_acquire);
+  size_t available = written - read < ring->capacity ? (size_t)(written - read)
+                                                     : ring->capacity;
+  size_t original = samples;
   if (samples > ring->capacity) {
     input += samples - ring->capacity;
     samples = ring->capacity;
   }
+  size_t free_samples = ring->capacity - available;
+  size_t overwritten = samples > free_samples ? samples - free_samples : 0;
   for (size_t i = 0; i < samples; ++i)
     ring->storage[(written + i) % ring->capacity] = input[i];
   atomic_store_explicit(&ring->written, written + samples,
                         memory_order_release);
+  atomic_fetch_add_explicit(&ring->discarded, original - samples + overwritten,
+                            memory_order_relaxed);
+}
+
+size_t rpcr_available(const struct rpcr_ring *ring) {
+  uint64_t written = atomic_load_explicit(&ring->written, memory_order_acquire);
+  uint64_t read = atomic_load_explicit(&ring->read, memory_order_acquire);
+  return written - read < ring->capacity ? (size_t)(written - read)
+                                         : ring->capacity;
+}
+
+void rpcr_record_shortfall(struct rpcr_ring *ring, size_t missing,
+                           size_t samples, unsigned int rate) {
+  atomic_fetch_add_explicit(&ring->missing, missing, memory_order_relaxed);
+  uint64_t consecutive =
+      missing ? atomic_fetch_add_explicit(&ring->consecutive_underruns, missing,
+                                          memory_order_relaxed) +
+                    missing
+              : 0;
+  if (!missing)
+    atomic_store_explicit(&ring->consecutive_underruns, 0,
+                          memory_order_relaxed);
+  uint64_t average =
+      atomic_load_explicit(&ring->underrun_average_milli, memory_order_relaxed);
+  uint64_t denominator = (uint64_t)rate * 10000U;
+  uint64_t weight = denominator ? (uint64_t)samples * 1000U : 0;
+  if (weight > denominator)
+    weight = denominator;
+  int64_t difference = (int64_t)(consecutive * 1000U) - (int64_t)average;
+  int64_t adjustment =
+      denominator ? difference * (int64_t)weight / (int64_t)denominator : 0;
+  atomic_store_explicit(&ring->underrun_average_milli,
+                        (uint64_t)((int64_t)average + adjustment),
+                        memory_order_relaxed);
 }
 
 bool rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
