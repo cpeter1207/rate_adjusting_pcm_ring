@@ -4,6 +4,8 @@ on:
     tags: ['v*']
 permissions:
   contents: write
+  pages: write
+  id-token: write
 jobs:
   release:
     uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/release.yml@main
