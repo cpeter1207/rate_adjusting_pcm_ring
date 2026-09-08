@@ -1,0 +1,12 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/release.yml@main
+    with:
+      code_ref: ${{ github.sha }}
+      tag: ${{ github.ref_name }}
