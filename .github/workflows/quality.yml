@@ -1,0 +1,10 @@
+name: Required quality
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  quality:
+    uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/quality.yml@main
