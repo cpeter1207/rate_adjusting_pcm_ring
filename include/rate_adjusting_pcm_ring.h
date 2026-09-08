@@ -84,15 +84,15 @@ void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples);
  * @param samples Requested output samples, not exceeding ring capacity.
  * @param reserve Minimum input samples retained to prevent underrun.
  * @param target Target ring occupancy used for clock correction and priming.
- * @return True when audio was rendered; false writes silence while unprimed or
- * empty.
+ * @return Number of rendered output samples; zero writes silence while
+ * unprimed or empty.
  *
  * Priming waits for @p target samples and then preserves @p reserve samples.
  * Occupancy and ratio each have slow filters, making independent source and
  * hardware-clock correction inaudible rather than periodically dropping PCM.
  */
-bool rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
-                 size_t reserve, size_t target);
+size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
+                   size_t reserve, size_t target);
 
 /** @brief Return published PCM available to the consumer.
  * @param ring Initialized ring.

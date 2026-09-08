@@ -112,8 +112,8 @@ void rpcr_record_shortfall(struct rpcr_ring *ring, size_t missing,
                         memory_order_relaxed);
 }
 
-bool rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
-                 size_t reserve, size_t target) {
+size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
+                   size_t reserve, size_t target) {
   uint64_t read = atomic_load_explicit(&ring->read, memory_order_relaxed);
   uint64_t written = atomic_load_explicit(&ring->written, memory_order_acquire);
   size_t available = written - read < ring->capacity ? (size_t)(written - read)
@@ -157,5 +157,5 @@ bool rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
   src_float_to_short_array(ring->output, output, (int)data.output_frames_gen);
   for (size_t i = (size_t)data.output_frames_gen; i < samples; ++i)
     output[i] = 0;
-  return data.output_frames_gen != 0;
+  return (size_t)data.output_frames_gen;
 }
