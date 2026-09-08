@@ -13,6 +13,7 @@ static unsigned int calloc_calls;
 static bool fail_src_new;
 static bool force_src_error;
 static bool fail_src_process;
+static long processed_input_frames;
 void *__real_calloc(size_t count, size_t size);
 SRC_STATE *__real_src_new(int converter_type, int channels, int *error);
 int __real_src_process(SRC_STATE *state, SRC_DATA *data);
@@ -31,6 +32,7 @@ SRC_STATE *__wrap_src_new(int converter_type, int channels, int *error) {
   return state;
 }
 int __wrap_src_process(SRC_STATE *state, SRC_DATA *data) {
+  processed_input_frames = data->input_frames;
   return fail_src_process ? 1 : __real_src_process(state, data);
 }
 
@@ -75,6 +77,10 @@ int main(void) {
     rendered = rpcr_render(&ring, output, 160, 0, 1024);
   }
   assert(rendered);
+  /* A callback may consume only a bounded amount of source PCM.  Letting
+   * libsamplerate drain the entire reserve margin creates a false underrun on
+   * the following callback while valid source PCM still exists. */
+  assert(processed_input_frames <= 320);
   assert(ring.ratio > 0.99 && ring.ratio < 1.01);
   assert(!rpcr_render(&ring, output, 160, ring.capacity, 480));
   /* Migrated from RPT Advanced elastic-peer tests: newest PCM survives overrun.
@@ -98,6 +104,12 @@ int main(void) {
   assert(atomic_load(&ring.consecutive_underruns) == 0);
   rpcr_record_shortfall(&ring, 1, 90000, 8000);
   rpcr_record_shortfall(&ring, 1, 160, 0);
+  rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  rpcr_write(&ring, input, 160);
+  processed_input_frames = 0;
+  assert(rpcr_render(&ring, output, 160, 0, 1));
+  assert(processed_input_frames == 160);
   rpcr_destroy(&ring);
   puts("rate-adjusting PCM ring tests passed");
   return 0;

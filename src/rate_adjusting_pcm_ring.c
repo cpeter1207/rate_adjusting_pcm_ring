@@ -127,6 +127,11 @@ size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
     return false;
   }
   size_t input_count = available - reserve;
+  /* samples is bounded by the allocated ring capacity above, so doubling it
+   * cannot overflow a valid allocation. */
+  size_t maximum_input = samples * 2;
+  if (input_count > maximum_input)
+    input_count = maximum_input;
   for (size_t i = 0; i < input_count; ++i)
     ring->input[i] = ring->storage[(read + i) % ring->capacity] / 32768.0F;
   /* Cascaded slow controls avoid callback-rate pitch modulation. */
