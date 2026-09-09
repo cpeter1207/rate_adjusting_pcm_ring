@@ -28,7 +28,7 @@ build/rate_adjusting_pcm_ring.o: $(SOURCE) $(HEADER) | build
 build/librate_adjusting_pcm_ring.a: build/rate_adjusting_pcm_ring.o
 	$(AR) rcs $@ $^
 $(LIB_SHARED): build/rate_adjusting_pcm_ring.o
-	$(CC) -shared -Wl,-soname,librate_adjusting_pcm_ring.so.$(LIB_SOVERSION) -o $@ $^ -lsamplerate
+	$(CC) -shared -Wl,-soname,librate_adjusting_pcm_ring.so.$(LIB_SOVERSION) -o $@ $^ -lsamplerate -lm
 $(LIB_SONAME): $(LIB_SHARED)
 	ln -sf $(notdir $<) $@
 build/librate_adjusting_pcm_ring.so: $(LIB_SONAME)
@@ -37,7 +37,7 @@ $(PC_FILE): $(PC_TEMPLATE) | build
 	sed -e 's|@PREFIX@|$(prefix)|' -e 's|@LIBDIR@|$(LIBDIR)|' \
 		-e 's|@VERSION@|$(VERSION)|' $< > $@
 build/test_ring: $(TEST) $(SOURCE) $(HEADER) | build
-	$(CC) $(CPPFLAGS) $(WARNINGS) -O0 -g --coverage $(TEST) $(SOURCE) -lsamplerate -Wl,--wrap=calloc,--wrap=src_new,--wrap=src_process -o $@
+	$(CC) $(CPPFLAGS) $(WARNINGS) -O0 -g --coverage $(TEST) $(SOURCE) -lsamplerate -lm -Wl,--wrap=calloc,--wrap=src_new,--wrap=src_process -o $@
 quality: lint static-analysis docs
 lint:
 	clang-format --dry-run --Werror $(SOURCE) $(HEADER) $(TEST) $(CONSUMER_TEST)
