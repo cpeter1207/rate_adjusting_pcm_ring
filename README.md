@@ -9,6 +9,16 @@ persistent libsamplerate converter with a deliberately slow occupancy-derived
 ratio. This corrects independent clocks without callback-rate pitch modulation
 or buffer-drop artifacts.
 
+On a source shortfall, the consumer retains recent real PCM and uses bounded
+pitch-period continuation with entry and recovery crossfades. This conceals a
+brief gap without blocking or allocating in either audio operation; sustained
+loss fades to silence instead of repeating speech indefinitely. Call
+`rpcr_set_sample_rate()` before rendering so the concealer uses the active PCM
+rate.  Call `rpcr_set_rates()` before rendering when producer and consumer
+rates differ; its single persistent converter performs both nominal conversion
+and clock correction.  `rpcr_set_sample_rate()` remains a shorthand for a
+same-rate ring.
+
 ## Build and verify
 
 Debian build prerequisites are a C11 compiler, GNU Make, libsamplerate headers,

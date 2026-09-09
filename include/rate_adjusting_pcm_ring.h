@@ -20,6 +20,19 @@ enum rpcr_quality {
   RPCR_SINC_FASTEST,
 };
 
+/** @brief Lock-free consumer/controller measurements captured by @ref
+ * rpcr_observe. */
+struct rpcr_observation {
+  size_t capacity_samples;  /**< Fixed ring capacity. */
+  size_t available_samples; /**< PCM currently readable from the producer. */
+  size_t reserve_samples;   /**< Current protected PCM floor. */
+  size_t filtered_occupancy_samples; /**< Slowly filtered clock-controller
+                                        occupancy. */
+  size_t target_samples;    /**< Latest requested clock-recovery target. */
+  int ratio_correction_ppm; /**< Applied source-ratio correction in parts per
+                               million. */
+};
+
 /** @brief One preallocated SPSC PCM ring and its consumer-only rate controller.
  *
  * Producer release-ordering publishes complete storage writes. The sole
@@ -31,6 +44,7 @@ struct rpcr_ring {
   int16_t *storage; /**< Owned PCM storage. */
   float *input;     /**< Owned consumer converter workspace. */
   float *output;    /**< Owned consumer converter workspace. */
+  int16_t *history; /**< Owned consumer PLC history. */
   size_t capacity;  /**< Storage and workspace capacity in samples. */
   atomic_uint_fast64_t
       written; /**< Producer-owned monotonically increasing cursor. */
@@ -45,10 +59,23 @@ struct rpcr_ring {
       underrun_average_milli; /**< Ten-second shortfall EWMA. */
   atomic_uint_fast64_t
       reserve_samples; /**< Latest consumer-selected retained input reserve. */
+  atomic_uint_fast64_t
+      target_samples; /**< Latest consumer-selected clock-recovery target. */
+  atomic_uint_fast64_t
+      filtered_occupancy_milli; /**< Published filtered occupancy in
+                                   millisamples. */
+  atomic_int
+      ratio_correction_ppm; /**< Published signed source-ratio correction. */
   struct SRC_STATE_tag
       *converter; /**< Consumer-owned persistent libsamplerate state. */
   uint64_t occupancy_milli; /**< Consumer-owned filtered occupancy. */
   double ratio;             /**< Consumer-owned filtered source ratio. */
+  size_t history_length;    /**< Valid PCM samples retained for PLC. */
+  size_t history_next;      /**< Next consumer-only PLC history position. */
+  size_t plc_period;        /**< Detected pitch period for an active erasure. */
+  size_t plc_samples;      /**< Samples synthesized during an active erasure. */
+  unsigned int input_rate; /**< PCM rate written by the producer. */
+  unsigned int output_rate; /**< PCM rate rendered by the consumer. */
   bool primed;              /**< Consumer starts only after target occupancy. */
 };
 
@@ -77,6 +104,33 @@ void rpcr_destroy(struct rpcr_ring *ring);
  */
 void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples);
 
+/** @brief Set one shared PCM rate for producer and consumer.
+ * @param ring Initialized ring whose producer and consumer are stopped.
+ * @param sample_rate PCM sample rate in Hz.
+ * @return Zero on success, or minus one for an invalid rate.
+ *
+ * This compatibility shorthand calls @ref rpcr_set_rates with identical
+ * input and output rates.  It must be set before the first call to
+ * @ref rpcr_render.
+ */
+int rpcr_set_sample_rate(struct rpcr_ring *ring, unsigned int sample_rate);
+
+/** @brief Set distinct producer and consumer PCM rates.
+ * @param ring Initialized ring whose producer and consumer are stopped.
+ * @param input_rate PCM rate written by @ref rpcr_write in Hz.
+ * @param output_rate PCM rate rendered by @ref rpcr_render in Hz.
+ * @return Zero on success, or minus one for an invalid rate.
+ *
+ * The persistent libsamplerate stream performs the nominal conversion and
+ * the slow occupancy-driven correction together.  Consequently a producer
+ * such as an 8 kHz Asterisk channel can feed a native-rate hardware callback
+ * without an intermediate converted PCM queue.  Capacity, reserve, target,
+ * and @ref rpcr_available remain expressed in input samples.  This function
+ * must be called before the first render, or after both endpoints stop.
+ */
+int rpcr_set_rates(struct rpcr_ring *ring, unsigned int input_rate,
+                   unsigned int output_rate);
+
 /** @brief Render one fixed hardware-paced PCM block with a slowly corrected
  * ratio.
  * @param ring Initialized ring with exactly one consumer.
@@ -84,12 +138,16 @@ void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples);
  * @param samples Requested output samples, not exceeding ring capacity.
  * @param reserve Minimum input samples retained to prevent underrun.
  * @param target Target ring occupancy used for clock correction and priming.
- * @return Number of rendered output samples; zero writes silence while
- * unprimed or empty.
+ * @return Number of real source samples rendered. Any shortfall is filled by
+ * consumer-side pitch waveform concealment when recent PCM history exists.
+ * Zero writes silence only before the first usable PCM history or after its
+ * bounded concealment tail has faded.
  *
  * Priming waits for @p target samples and then preserves @p reserve samples.
  * Occupancy and ratio each have slow filters, making independent source and
  * hardware-clock correction inaudible rather than periodically dropping PCM.
+ * A real-to-concealed and concealed-to-real crossfade prevents sample-edge
+ * clicks; only real source samples advance the producer cursor.
  */
 size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
                    size_t reserve, size_t target);
@@ -99,6 +157,18 @@ size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
  * @return Readable sample count, bounded by capacity.
  */
 size_t rpcr_available(const struct rpcr_ring *ring);
+
+/** @brief Copy lock-free occupancy and source-rate-controller measurements.
+ * @param ring Initialized ring, or null to return an all-zero observation.
+ * @param observation Destination for one diagnostic snapshot, or null to
+ * discard it.
+ *
+ * Producer and consumer continue independently while this function runs.
+ * Fields are individually current rather than transactionally coherent, so
+ * live diagnostics never put a lock in an audio path.
+ */
+void rpcr_observe(const struct rpcr_ring *ring,
+                  struct rpcr_observation *observation);
 
 /** @brief Update observable output-shortfall statistics after one callback.
  * @param ring Initialized consumer-owned ring.

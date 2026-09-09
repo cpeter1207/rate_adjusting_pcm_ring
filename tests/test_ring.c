@@ -36,6 +36,13 @@ int __wrap_src_process(SRC_STATE *state, SRC_DATA *data) {
   return fail_src_process ? 1 : __real_src_process(state, data);
 }
 
+static void seed_history(struct rpcr_ring *ring, size_t period) {
+  for (size_t index = 0; index < ring->capacity; ++index)
+    ring->history[index] = (int16_t)((index % period) * 300 - 12000);
+  ring->history_length = ring->capacity;
+  ring->history_next = 0;
+}
+
 int main(void) {
   struct rpcr_ring ring;
   int16_t input[2048];
@@ -48,7 +55,7 @@ int main(void) {
   assert(rpcr_init(NULL, 1024, RPCR_SINC_BEST) != 0);
   assert(rpcr_init(&ring, 0, RPCR_SINC_BEST) != 0);
   assert(rpcr_init(&ring, 1, (enum rpcr_quality)99) != 0);
-  for (unsigned int attempt = 1; attempt <= 3; ++attempt) {
+  for (unsigned int attempt = 1; attempt <= 4; ++attempt) {
     fail_calloc_call = attempt;
     calloc_calls = 0;
     assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) != 0);
@@ -65,10 +72,28 @@ int main(void) {
   assert(rpcr_init(&ring, 1024, RPCR_SINC_FASTEST) == 0);
   rpcr_destroy(&ring);
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(NULL, 8000) != 0);
+  assert(rpcr_set_sample_rate(&ring, 0) != 0);
+  assert(rpcr_set_rates(NULL, 8000, 48000) != 0);
+  assert(rpcr_set_rates(&ring, 0, 48000) != 0);
+  assert(rpcr_set_rates(&ring, 8000, 0) != 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  assert(ring.input_rate == 8000 && ring.output_rate == 8000);
   assert(rpcr_available(&ring) == 0);
+  struct rpcr_observation observation = {0};
+  rpcr_observe(NULL, &observation);
+  assert(!observation.capacity_samples && !observation.available_samples &&
+         !observation.ratio_correction_ppm);
+  rpcr_observe(&ring, NULL);
+  rpcr_observe(&ring, &observation);
+  assert(observation.capacity_samples == ring.capacity &&
+         !observation.available_samples && !observation.target_samples);
   /* Migrated from USBRadioPlus native-FIFO priming: protected reserve is
    * silence. */
   assert(!rpcr_render(&ring, output, 160, 320, 480));
+  rpcr_observe(&ring, &observation);
+  assert(observation.reserve_samples == 320 &&
+         observation.target_samples == 480);
   rpcr_write(&ring, input, 1024);
   assert(rpcr_available(&ring) == ring.capacity);
   assert(!rpcr_render(&ring, oversized, 1025, 0, 480));
@@ -82,6 +107,11 @@ int main(void) {
    * the following callback while valid source PCM still exists. */
   assert(processed_input_frames <= 320);
   assert(ring.ratio > 0.99 && ring.ratio < 1.01);
+  rpcr_observe(&ring, &observation);
+  assert(observation.available_samples <= observation.capacity_samples &&
+         observation.filtered_occupancy_samples &&
+         observation.reserve_samples == 0 &&
+         observation.target_samples == 1024);
   assert(!rpcr_render(&ring, output, 160, ring.capacity, 480));
   /* Migrated from RPT Advanced elastic-peer tests: newest PCM survives overrun.
    */
@@ -93,6 +123,8 @@ int main(void) {
   ring.occupancy_milli = (uint64_t)ring.capacity * 3000U;
   assert(rpcr_render(&ring, output, 160, 0, 1));
   assert(ring.ratio < 1.0 && ring.ratio > 0.99);
+  rpcr_observe(&ring, &observation);
+  assert(observation.ratio_correction_ppm < 0);
   fail_src_process = true;
   assert(!rpcr_render(&ring, output, 160, 0, 480));
   fail_src_process = false;
@@ -105,18 +137,108 @@ int main(void) {
   rpcr_record_shortfall(&ring, 1, 90000, 8000);
   rpcr_record_shortfall(&ring, 1, 160, 0);
   rpcr_destroy(&ring);
+  /* One persistent stream combines an 8 kHz source conversion with the
+   * slow occupancy correction used by a 48 kHz hardware callback. */
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_rates(&ring, 8000, 48000) == 0);
+  rpcr_write(&ring, input, 1024);
+  processed_input_frames = 0;
+  assert(rpcr_render(&ring, output, 960, 0, 480));
+  assert(processed_input_frames <= 320);
+  assert(ring.ratio > 5.99 && ring.ratio < 6.01);
+  rpcr_observe(&ring, &observation);
+  assert(observation.ratio_correction_ppm > -100 &&
+         observation.ratio_correction_ppm < 100);
+  rpcr_write(&ring, input, 1024);
+  assert(rpcr_render(&ring, output, 960, 0, 0));
+  rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   rpcr_write(&ring, input, 160);
   processed_input_frames = 0;
   assert(rpcr_render(&ring, output, 160, 0, 1));
   assert(processed_input_frames == 160);
   rpcr_destroy(&ring);
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   rpcr_write(&ring, input, 1024);
   int16_t tiny_output[2];
   processed_input_frames = 0;
   (void)rpcr_render(&ring, tiny_output, 2, 0, 1);
   assert(processed_input_frames == 256);
+  rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  /* A ring with no configured PCM rate retains historical silence behavior. */
+  seed_history(&ring, 80);
+  ring.primed = true;
+  assert(!rpcr_render(&ring, output, 2, 0, 1));
+  assert(!output[0] && !output[1]);
+  /* A partially configured ring must also fail closed. */
+  ring.input_rate = 8000;
+  assert(!rpcr_render(&ring, output, 2, 0, 1));
+  /* Low-rate validation covers the generic concealer's zero-duration guards. */
+  ring.plc_samples = ring.plc_period = 0;
+  assert(rpcr_set_sample_rate(&ring, 1) == 0);
+  assert(!rpcr_render(&ring, output, 2, 0, 1));
+  ring.plc_period = 1;
+  ring.plc_samples = 1;
+  assert(!rpcr_render(&ring, output, 2, 0, 1));
+  ring.plc_samples = ring.plc_period = 0;
+  assert(rpcr_set_sample_rate(&ring, 48000) == 0);
+  assert(!rpcr_render(&ring, output, 2, 0, 1));
+  rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  /* A recent periodic waveform is continued across a short source shortage,
+   * rather than replaced with zero-valued PCM. */
+  seed_history(&ring, 80);
+  ring.primed = true;
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  assert(!rpcr_render(&ring, output, 160, 0, 480));
+  assert(ring.plc_period == 80);
+  assert(output[100] != 0);
+  /* The bounded PLC tail fades out after 60 ms of missing source PCM. */
+  assert(!rpcr_render(&ring, output, 160, 0, 480));
+  assert(!rpcr_render(&ring, output, 160, 0, 480));
+  assert(!rpcr_render(&ring, output, 160, 0, 480));
+  assert(output[159] == 0);
+  /* A real waveform crossfades back in and resets the erasure state. */
+  rpcr_write(&ring, input, 1024);
+  bool recovered = false;
+  for (size_t attempt = 0; attempt < 4 && !recovered; ++attempt)
+    recovered = rpcr_render(&ring, output, 160, 0, 1) != 0;
+  assert(recovered);
+  assert(ring.plc_samples == 0);
+  rpcr_destroy(&ring);
+  /* Equal-power entry may exceed PCM range only when both adjacent segments
+   * are already at a rail; saturate rather than wrap at either polarity. */
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  for (size_t index = 0; index < ring.capacity; ++index)
+    ring.history[index] = INT16_MAX;
+  ring.history_length = ring.capacity;
+  ring.primed = true;
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  assert(!rpcr_render(&ring, output, 2, 0, 480));
+  assert(output[0] == INT16_MAX);
+  for (size_t index = 0; index < ring.capacity; ++index)
+    ring.history[index] = INT16_MIN;
+  ring.history_length = ring.capacity;
+  ring.history_next = 0;
+  ring.plc_period = ring.plc_samples = 0;
+  assert(!rpcr_render(&ring, output, 2, 0, 480));
+  assert(output[0] == INT16_MIN);
+  rpcr_destroy(&ring);
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  seed_history(&ring, 80);
+  ring.primed = true;
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  ring.plc_period = 80;
+  ring.plc_samples = 1;
+  rpcr_write(&ring, input, 1024);
+  bool short_recovery = false;
+  for (size_t attempt = 0; attempt < 4 && !short_recovery; ++attempt)
+    short_recovery = rpcr_render(&ring, tiny_output, 2, 0, 1) != 0;
+  assert(short_recovery);
+  assert(ring.plc_samples == 0);
   rpcr_destroy(&ring);
   puts("rate-adjusting PCM ring tests passed");
   return 0;
