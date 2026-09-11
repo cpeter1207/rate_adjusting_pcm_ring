@@ -35,10 +35,9 @@ struct rpcr_observation {
 
 /** @brief One preallocated SPSC PCM ring and its consumer-only rate controller.
  *
- * Producer release-ordering publishes complete storage writes. The sole
- * consumer acquires that cursor and advances @ref read. Render and write are
- * therefore lock-free and allocation-free. Persistent conversion retains
- * history across callbacks, avoiding frame-boundary artifacts.
+ * Producer release-ordering publishes one source sample at a time. The sole
+ * consumer acquires that cursor and renders one output sample at a time.
+ * Both operations are lock-free and allocation-free after initialization.
  */
 struct rpcr_ring {
   int16_t *storage; /**< Owned PCM storage. */
@@ -50,7 +49,7 @@ struct rpcr_ring {
       written; /**< Producer-owned monotonically increasing cursor. */
   atomic_uint_fast64_t
       read; /**< Consumer-owned monotonically increasing cursor. */
-  atomic_uint_fast64_t discarded; /**< Producer-observed overwritten samples. */
+  atomic_uint_fast64_t discarded; /**< Producer-dropped incoming samples. */
   atomic_uint_fast64_t
       missing; /**< Consumer-observed output shortfall samples. */
   atomic_uint_fast64_t
@@ -70,13 +69,19 @@ struct rpcr_ring {
       *converter; /**< Consumer-owned persistent libsamplerate state. */
   uint64_t occupancy_milli; /**< Consumer-owned filtered occupancy. */
   double ratio;             /**< Consumer-owned filtered source ratio. */
+  size_t input_offset;      /**< First pending converter input sample. */
+  size_t input_pending;     /**< Consumer-staged source samples. */
+  size_t output_offset;     /**< First pending converted output sample. */
+  size_t output_pending;    /**< Consumer-staged converted output samples. */
   size_t history_length;    /**< Valid PCM samples retained for PLC. */
   size_t history_next;      /**< Next consumer-only PLC history position. */
   size_t plc_period;        /**< Detected pitch period for an active erasure. */
   size_t plc_samples;      /**< Samples synthesized during an active erasure. */
+  size_t recovery_samples; /**< Remaining real/synthetic recovery crossfade. */
   unsigned int input_rate; /**< PCM rate written by the producer. */
   unsigned int output_rate; /**< PCM rate rendered by the consumer. */
-  bool primed;              /**< Consumer starts only after target occupancy. */
+  bool primed; /**< @deprecated Retained source compatibility state; it no
+                  longer gates playout. */
 };
 
 /** @brief Allocate a ring and persistent converter outside real-time
@@ -96,8 +101,28 @@ int rpcr_init(struct rpcr_ring *ring, size_t capacity,
  */
 void rpcr_destroy(struct rpcr_ring *ring);
 
-/** @brief Write bounded PCM without blocking, preserving the newest samples on
- * overrun.
+/** @brief Publish one source PCM sample without waiting.
+ * @return True when the sample was published, false when the ring is full.
+ */
+bool rpcr_producer_push_sample(struct rpcr_ring *ring, int16_t sample);
+
+/** @brief Consume one raw source sample without waiting.
+ * @return True when a source sample was acquired.
+ */
+bool rpcr_consumer_pop_sample(struct rpcr_ring *ring, int16_t *sample);
+
+/** @brief Render one hardware-paced PCM sample with persistent conversion.
+ *
+ * The consumer begins using source PCM immediately; @p target controls only
+ * slow clock correction. A shortfall produces one concealed sample.
+ * @return True when the output came from real converted source PCM.
+ */
+bool rpcr_consumer_render_sample(struct rpcr_ring *ring, int16_t *output,
+                                 size_t target);
+
+/** @brief Publish bounded PCM without blocking or overwriting unread storage.
+ *
+ * This compatibility wrapper loops over @ref rpcr_producer_push_sample.
  * @param ring Initialized ring with exactly one producer.
  * @param input PCM samples to publish.
  * @param samples Number of samples.
@@ -121,8 +146,8 @@ int rpcr_set_sample_rate(struct rpcr_ring *ring, unsigned int sample_rate);
  * @param output_rate PCM rate rendered by @ref rpcr_render in Hz.
  * @return Zero on success, or minus one for an invalid rate.
  *
- * The persistent libsamplerate stream performs the nominal conversion and
- * the slow occupancy-driven correction together.  Consequently a producer
+ * The persistent libsamplerate stream performs nominal conversion and slow
+ * occupancy-driven correction together. Consequently a producer
  * such as an 8 kHz Asterisk channel can feed a native-rate hardware callback
  * without an intermediate converted PCM queue.  Capacity, reserve, target,
  * and @ref rpcr_available remain expressed in input samples.  This function
@@ -136,18 +161,14 @@ int rpcr_set_rates(struct rpcr_ring *ring, unsigned int input_rate,
  * @param ring Initialized ring with exactly one consumer.
  * @param output Destination PCM block.
  * @param samples Requested output samples, not exceeding ring capacity.
- * @param reserve Minimum input samples retained to prevent underrun.
- * @param target Target ring occupancy used for clock correction and priming.
+ * @param reserve Retained for source compatibility; no longer gates playout.
+ * @param target Target ring occupancy used for clock correction.
  * @return Number of real source samples rendered. Any shortfall is filled by
  * consumer-side pitch waveform concealment when recent PCM history exists.
  * Zero writes silence only before the first usable PCM history or after its
  * bounded concealment tail has faded.
  *
- * Priming waits for @p target samples and then preserves @p reserve samples.
- * Occupancy and ratio each have slow filters, making independent source and
- * hardware-clock correction inaudible rather than periodically dropping PCM.
- * A real-to-concealed and concealed-to-real crossfade prevents sample-edge
- * clicks; only real source samples advance the producer cursor.
+ * This compatibility wrapper loops over @ref rpcr_consumer_render_sample.
  */
 size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
                    size_t reserve, size_t target);

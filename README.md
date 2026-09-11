@@ -4,10 +4,17 @@ Lock-free, single-producer/single-consumer PCM playout ring with persistent
 libsamplerate clock recovery for real-time audio callbacks.
 
 The producer publishes signed 16-bit mono PCM without waiting. The consumer
-keeps a configured reserve, starts only after priming, and drives one
-persistent libsamplerate converter with a deliberately slow occupancy-derived
-ratio. This corrects independent clocks without callback-rate pitch modulation
-or buffer-drop artifacts.
+uses available PCM immediately and drives one persistent libsamplerate
+converter with a deliberately slow occupancy-derived ratio. The target
+occupancy steers that ratio; it is not a playout-start threshold. This corrects
+independent clocks without callback-rate pitch modulation or periodic
+buffer-adjustment artifacts.
+
+The producer never overwrites PCM that the consumer has not released. If the
+ring fills, it publishes the leading portion that fits and drops the remaining
+incoming samples; the public `discarded` counter records those drops. This
+preserves strict single-producer/single-consumer ownership and chronological
+playout without locks or allocation in either audio operation.
 
 On a source shortfall, the consumer retains recent real PCM and uses bounded
 pitch-period continuation with entry and recovery crossfades. This conceals a
@@ -18,6 +25,36 @@ rate.  Call `rpcr_set_rates()` before rendering when producer and consumer
 rates differ; its single persistent converter performs both nominal conversion
 and clock correction.  `rpcr_set_sample_rate()` remains a shorthand for a
 same-rate ring.
+
+## API and compatibility
+
+The real-time API is sample-at-a-time:
+
+1. Initialize the ring with `rpcr_init()` and set its rates before either
+   endpoint starts.
+2. The sole producer calls `rpcr_producer_push_sample()` for each source PCM
+   sample.
+3. The sole hardware-paced consumer calls
+   `rpcr_consumer_render_sample()` for each requested output sample. It returns
+   `false` and supplies bounded concealment when source PCM is unavailable.
+
+`rpcr_consumer_pop_sample()` is available for a consumer that needs raw source
+PCM instead of rate-adjusted output. It and `rpcr_consumer_render_sample()`
+share the same consumer cursor, so a consumer uses one or the other for a
+given ring at a time.
+
+The older block calls remain source-compatible: `rpcr_write()` loops over
+`rpcr_producer_push_sample()`, and `rpcr_render()` loops over
+`rpcr_consumer_render_sample()`. Their playout behavior intentionally follows
+the sample API. In particular, `reserve` is retained for diagnostics and
+`target` only steers slow clock recovery; neither reserve, priming, nor target
+occupancy gates playout. The public `primed` member is retained only for source
+compatibility and no longer controls playout.
+
+Version 1 introduces the sample staging state in the public `struct rpcr_ring`
+and therefore has a new shared-library ABI major. Programs built against 0.x
+must be rebuilt and linked with `librate_adjusting_pcm_ring.so.1`; source users
+of the block API can otherwise retain their existing calls.
 
 ## Build and verify
 

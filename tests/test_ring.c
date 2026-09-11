@@ -13,7 +13,10 @@ static unsigned int calloc_calls;
 static bool fail_src_new;
 static bool force_src_error;
 static bool fail_src_process;
+static unsigned int invalid_src_result;
 static long processed_input_frames;
+static float captured_input[1024];
+static long captured_input_frames;
 void *__real_calloc(size_t count, size_t size);
 SRC_STATE *__real_src_new(int converter_type, int channels, int *error);
 int __real_src_process(SRC_STATE *state, SRC_DATA *data);
@@ -33,7 +36,23 @@ SRC_STATE *__wrap_src_new(int converter_type, int channels, int *error) {
 }
 int __wrap_src_process(SRC_STATE *state, SRC_DATA *data) {
   processed_input_frames = data->input_frames;
-  return fail_src_process ? 1 : __real_src_process(state, data);
+  captured_input_frames = data->input_frames;
+  assert(data->input_frames <=
+         (long)(sizeof(captured_input) / sizeof(captured_input[0])));
+  for (long index = 0; index < data->input_frames; ++index)
+    captured_input[index] = data->data_in[index];
+  if (fail_src_process)
+    return 1;
+  int result = __real_src_process(state, data);
+  if (invalid_src_result == 1)
+    data->input_frames_used = -1;
+  else if (invalid_src_result == 2)
+    data->input_frames_used = data->input_frames + 1;
+  else if (invalid_src_result == 3)
+    data->output_frames_gen = 0;
+  else if (invalid_src_result == 4)
+    data->output_frames_gen = data->output_frames + 1;
+  return result;
 }
 
 static void seed_history(struct rpcr_ring *ring, size_t period) {
@@ -75,6 +94,7 @@ int main(void) {
   assert(rpcr_set_sample_rate(NULL, 8000) != 0);
   assert(rpcr_set_sample_rate(&ring, 0) != 0);
   assert(rpcr_set_rates(NULL, 8000, 48000) != 0);
+  assert(rpcr_set_rates(&(struct rpcr_ring){0}, 8000, 48000) != 0);
   assert(rpcr_set_rates(&ring, 0, 48000) != 0);
   assert(rpcr_set_rates(&ring, 8000, 0) != 0);
   assert(rpcr_set_sample_rate(&ring, 8000) == 0);
@@ -88,8 +108,7 @@ int main(void) {
   rpcr_observe(&ring, &observation);
   assert(observation.capacity_samples == ring.capacity &&
          !observation.available_samples && !observation.target_samples);
-  /* Migrated from USBRadioPlus native-FIFO priming: protected reserve is
-   * silence. */
+  /* An empty ring produces a shortfall while still publishing diagnostics. */
   assert(!rpcr_render(&ring, output, 160, 320, 480));
   rpcr_observe(&ring, &observation);
   assert(observation.reserve_samples == 320 &&
@@ -112,9 +131,8 @@ int main(void) {
          observation.filtered_occupancy_samples &&
          observation.reserve_samples == 0 &&
          observation.target_samples == 1024);
-  assert(!rpcr_render(&ring, output, 160, ring.capacity, 480));
-  /* Migrated from RPT Advanced elastic-peer tests: newest PCM survives overrun.
-   */
+  assert(rpcr_render(&ring, output, 160, ring.capacity, 480));
+  /* A full SPSC ring drops new input rather than overwriting unread slots. */
   rpcr_write(&ring, input, 2048);
   assert(atomic_load(&ring.discarded) > 0);
   assert(rpcr_render(&ring, output, 160, 0, 480));
@@ -125,9 +143,14 @@ int main(void) {
   assert(ring.ratio < 1.0 && ring.ratio > 0.99);
   rpcr_observe(&ring, &observation);
   assert(observation.ratio_correction_ppm < 0);
+  ring.output_pending = 0;
+  ring.output_offset = 0;
   fail_src_process = true;
   assert(!rpcr_render(&ring, output, 160, 0, 480));
   fail_src_process = false;
+  atomic_store(&ring.missing, 0);
+  atomic_store(&ring.consecutive_underruns, 0);
+  atomic_store(&ring.underrun_average_milli, 0);
   rpcr_record_shortfall(&ring, 2, 160, 8000);
   assert(atomic_load(&ring.missing) == 2);
   assert(atomic_load(&ring.consecutive_underruns) == 2);
@@ -159,6 +182,50 @@ int main(void) {
   assert(rpcr_render(&ring, output, 160, 0, 1));
   assert(processed_input_frames == 160);
   rpcr_destroy(&ring);
+  /* The sample API is the real-time interface. It consumes immediately rather
+   * than waiting for the occupancy target used by the clock controller. */
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  assert(!rpcr_producer_push_sample(NULL, 1));
+  assert(!rpcr_consumer_pop_sample(NULL, output));
+  assert(!rpcr_consumer_render_sample(NULL, output, 480));
+  assert(!rpcr_consumer_render_sample(&ring, NULL, 480));
+  assert(rpcr_producer_push_sample(&ring, 77));
+  assert(rpcr_consumer_pop_sample(&ring, output));
+  assert(output[0] == 77);
+  for (size_t index = 0; index < 1024; ++index)
+    assert(rpcr_producer_push_sample(&ring, input[index]));
+  assert(rpcr_consumer_render_sample(&ring, output, 480));
+  assert(!rpcr_consumer_pop_sample(&ring, NULL));
+  rpcr_write(NULL, input, 1);
+  rpcr_write(&ring, NULL, 1);
+  assert(!rpcr_render(NULL, output, 1, 0, 1));
+  assert(!rpcr_render(&ring, NULL, 1, 0, 1));
+  rpcr_destroy(&ring);
+
+  /* Every rejected converter result fails closed without producing PCM. */
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  ring.input_rate = 0;
+  assert(!rpcr_consumer_render_sample(&ring, output, 1));
+  ring.input_rate = 8000;
+  ring.output_rate = 0;
+  assert(!rpcr_consumer_render_sample(&ring, output, 1));
+  ring.output_rate = 8000;
+  SRC_STATE *converter = ring.converter;
+  ring.converter = NULL;
+  assert(!rpcr_consumer_render_sample(&ring, output, 1));
+  ring.converter = converter;
+  rpcr_write(&ring, input, 1024);
+  for (invalid_src_result = 1; invalid_src_result <= 4; ++invalid_src_result) {
+    ring.output_pending = 0;
+    ring.input_pending = 0;
+    ring.input_offset = 0;
+    assert(!rpcr_consumer_render_sample(&ring, output, 1));
+  }
+  invalid_src_result = 0;
+  rpcr_destroy(&ring);
+
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
   assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   rpcr_write(&ring, input, 1024);
@@ -170,7 +237,6 @@ int main(void) {
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
   /* A ring with no configured PCM rate retains historical silence behavior. */
   seed_history(&ring, 80);
-  ring.primed = true;
   assert(!rpcr_render(&ring, output, 2, 0, 1));
   assert(!output[0] && !output[1]);
   /* A partially configured ring must also fail closed. */
@@ -191,7 +257,6 @@ int main(void) {
   /* A recent periodic waveform is continued across a short source shortage,
    * rather than replaced with zero-valued PCM. */
   seed_history(&ring, 80);
-  ring.primed = true;
   assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   assert(!rpcr_render(&ring, output, 160, 0, 480));
   assert(ring.plc_period == 80);
@@ -209,13 +274,64 @@ int main(void) {
   assert(recovered);
   assert(ring.plc_samples == 0);
   rpcr_destroy(&ring);
+
+  /* Exercise defensive raw-SPSC and converter-cache edge cases directly. */
+  assert(rpcr_init(&ring, 8, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  assert(!rpcr_producer_push_sample(NULL, 1));
+  struct rpcr_ring invalid = {0};
+  assert(!rpcr_producer_push_sample(&invalid, 1));
+  invalid.storage = ring.storage;
+  assert(!rpcr_producer_push_sample(&invalid, 1));
+  assert(!rpcr_consumer_pop_sample(NULL, output));
+  assert(!rpcr_consumer_pop_sample(&invalid, output));
+  invalid.storage = NULL;
+  invalid.capacity = 1;
+  assert(!rpcr_consumer_pop_sample(&invalid, output));
+  invalid.storage = ring.storage;
+  invalid.capacity = 0;
+  assert(!rpcr_consumer_pop_sample(&invalid, output));
+  invalid.input = ring.input;
+  invalid.output = ring.output;
+  invalid.converter = ring.converter;
+  invalid.input_rate = 8000;
+  invalid.output_rate = 8000;
+  assert(!rpcr_consumer_render_sample(&invalid, output, 1));
+  invalid.capacity = ring.capacity;
+  atomic_init(&invalid.read, 0);
+  atomic_init(&invalid.written, ring.capacity + 1U);
+  assert(!rpcr_consumer_pop_sample(&invalid, output));
+  atomic_store(&invalid.written, 0);
+  assert(!rpcr_consumer_pop_sample(&invalid, output));
+  ring.input_offset = 1;
+  ring.input_pending = 1;
+  ring.input[1] = 0.0F;
+  for (size_t index = 0; index < 7; ++index)
+    assert(rpcr_producer_push_sample(&ring, input[index]));
+  (void)rpcr_consumer_render_sample(&ring, output, 1);
+  ring.output_pending = 1;
+  ring.output[0] = 0.0F;
+  ring.output_rate = 1;
+  ring.plc_period = ring.plc_samples = 1;
+  (void)rpcr_consumer_render_sample(&ring, output, 1);
+  assert(!ring.plc_samples);
+  rpcr_destroy(&ring);
+
+  /* An offset that still fits in the workspace must not be compacted. */
+  assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  ring.input_offset = 1;
+  ring.input_pending = 1;
+  ring.input[1] = 0.0F;
+  rpcr_write(&ring, input, 255);
+  (void)rpcr_consumer_render_sample(&ring, output, 1);
+  rpcr_destroy(&ring);
   /* Equal-power entry may exceed PCM range only when both adjacent segments
    * are already at a rail; saturate rather than wrap at either polarity. */
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
   for (size_t index = 0; index < ring.capacity; ++index)
     ring.history[index] = INT16_MAX;
   ring.history_length = ring.capacity;
-  ring.primed = true;
   assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   assert(!rpcr_render(&ring, output, 2, 0, 480));
   assert(output[0] == INT16_MAX);
@@ -227,9 +343,29 @@ int main(void) {
   assert(!rpcr_render(&ring, output, 2, 0, 480));
   assert(output[0] == INT16_MIN);
   rpcr_destroy(&ring);
+
+  /* Partial and full overruns must retain chronological unread PCM, not rotate
+   * the storage window by overwriting its oldest slots. Capture the converter
+   * input directly because a short sinc block need not generate output. */
+  assert(rpcr_init(&ring, 8, RPCR_SINC_BEST) == 0);
+  assert(rpcr_set_sample_rate(&ring, 8000) == 0);
+  const int16_t initial[6] = {0, 1, 2, 3, 4, 5};
+  const int16_t incoming[4] = {6, 7, 8, 9};
+  const int16_t rejected[2] = {10, 11};
+  rpcr_write(&ring, initial, 6);
+  rpcr_write(&ring, incoming, 4);
+  rpcr_write(&ring, rejected, 2);
+  assert(rpcr_available(&ring) == 8);
+  assert(atomic_load(&ring.discarded) == 4);
+  captured_input_frames = 0;
+  (void)rpcr_render(&ring, output, 2, 0, 1);
+  assert(captured_input_frames == 8);
+  for (size_t index = 0; index < 8; ++index)
+    assert(captured_input[index] == (float)index / 32768.0F);
+  rpcr_destroy(&ring);
+
   assert(rpcr_init(&ring, 1024, RPCR_SINC_BEST) == 0);
   seed_history(&ring, 80);
-  ring.primed = true;
   assert(rpcr_set_sample_rate(&ring, 8000) == 0);
   ring.plc_period = 80;
   ring.plc_samples = 1;
@@ -238,6 +374,7 @@ int main(void) {
   for (size_t attempt = 0; attempt < 4 && !short_recovery; ++attempt)
     short_recovery = rpcr_render(&ring, tiny_output, 2, 0, 1) != 0;
   assert(short_recovery);
+  assert(rpcr_render(&ring, output, 160, 0, 1));
   assert(ring.plc_samples == 0);
   rpcr_destroy(&ring);
   puts("rate-adjusting PCM ring tests passed");

@@ -4,11 +4,16 @@ AR ?= ar
 CPPFLAGS += -Iinclude
 CFLAGS ?= -O2 -g
 WARNINGS := -std=c11 -Wall -Wextra -Wpedantic -Werror
+# Debian 12's Cppcheck predates --check-level.  Analyse every supported
+# configuration there, and ask newer releases for their exhaustive pass too.
+CPPHECK_EXHAUSTIVE := $(shell cppcheck --help 2>&1 | grep -q -- '--check-level' && printf '%s' '--check-level=exhaustive')
 SOURCE := src/rate_adjusting_pcm_ring.c
 HEADER := include/rate_adjusting_pcm_ring.h
 TEST := tests/test_ring.c
 CONSUMER_TEST := tests/test_consumer.c
-VERSION ?= 0.1.0-dev
+# The public ring structure gained consumer staging state in the per-sample
+# API, so development artifacts deliberately carry the new ABI major.
+VERSION ?= 1.0.0-dev
 LIB_VERSION := $(VERSION)
 LIB_SOVERSION := $(word 1,$(subst ., ,$(LIB_VERSION)))
 LIB_SHARED := build/librate_adjusting_pcm_ring.so.$(LIB_VERSION)
@@ -19,7 +24,7 @@ LIBDIR ?= $(prefix)/lib
 PC_TEMPLATE := rate_adjusting_pcm_ring.pc.in
 PC_FILE := build/rate_adjusting_pcm_ring.pc
 
-.PHONY: all quality lint static-analysis docs test coverage install install-check distcheck platform-verify ci clean
+.PHONY: all quality lint static-analysis docs test coverage install install-check distcheck platform-verify ci clean FORCE
 all: build/librate_adjusting_pcm_ring.a $(LIB_SHARED) $(LIB_SONAME) build/librate_adjusting_pcm_ring.so
 build:
 	mkdir -p $@
@@ -33,7 +38,10 @@ $(LIB_SONAME): $(LIB_SHARED)
 	ln -sf $(notdir $<) $@
 build/librate_adjusting_pcm_ring.so: $(LIB_SONAME)
 	ln -sf $(notdir $<) $@
-$(PC_FILE): $(PC_TEMPLATE) | build
+# The install prefix is a Make variable, not a file dependency.  Regenerate
+# the pkg-config metadata on every invocation so staged package installs do
+# not retain a prior default prefix.
+$(PC_FILE): $(PC_TEMPLATE) FORCE | build
 	sed -e 's|@PREFIX@|$(prefix)|' -e 's|@LIBDIR@|$(LIBDIR)|' \
 		-e 's|@VERSION@|$(VERSION)|' $< > $@
 build/test_ring: $(TEST) $(SOURCE) $(HEADER) | build
@@ -42,7 +50,7 @@ quality: lint static-analysis docs
 lint:
 	clang-format --dry-run --Werror $(SOURCE) $(HEADER) $(TEST) $(CONSUMER_TEST)
 static-analysis:
-	cppcheck --check-level=exhaustive --enable=warning,style,performance,portability --error-exitcode=1 --std=c11 -Iinclude $(SOURCE) $(TEST) $(CONSUMER_TEST)
+	cppcheck $(CPPHECK_EXHAUSTIVE) --force --enable=warning,style,performance,portability --error-exitcode=1 --std=c11 -Iinclude $(SOURCE) $(TEST) $(CONSUMER_TEST)
 	clang-tidy $(SOURCE) --warnings-as-errors='*' -- -std=c11 -Iinclude
 docs: | build
 	doxygen Doxyfile
@@ -83,3 +91,5 @@ platform-verify: coverage install-check distcheck
 ci: quality platform-verify
 clean:
 	rm -rf build
+
+FORCE:

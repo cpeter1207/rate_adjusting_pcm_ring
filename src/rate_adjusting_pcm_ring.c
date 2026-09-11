@@ -7,8 +7,14 @@
 #include <samplerate.h>
 #include <stdlib.h>
 
-_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
-               "real-time ratio diagnostics require lock-free atomics");
+/** @cond INTERNAL
+ * Reject targets whose diagnostic or cursor atomics could take a hidden
+ * library lock in the audio callback.
+ */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_LONG_LOCK_FREE == 2 &&
+                   ATOMIC_LLONG_LOCK_FREE == 2,
+               "real-time PCM ring requires lock-free callback atomics");
+/** @endcond */
 
 /** @brief Lowest voiced fundamental used by generic speech concealment. */
 #define RPCR_PLC_MIN_PITCH_HZ 60U
@@ -143,6 +149,7 @@ static void conceal_output(struct rpcr_ring *ring, int16_t *output,
                            size_t samples) {
   if (!ring->plc_samples)
     ring->plc_period = detect_pitch(ring);
+  ring->recovery_samples = 0;
   size_t crossfade =
       milliseconds_to_samples(ring->output_rate, RPCR_PLC_CROSSFADE_MS);
   int16_t previous = ring->history_length ? history_back(ring, 1) : 0;
@@ -156,21 +163,92 @@ static void conceal_output(struct rpcr_ring *ring, int16_t *output,
   }
 }
 
-/** @brief Smooth a recovered source waveform into the synthesized tail. */
-static void recover_output(struct rpcr_ring *ring, int16_t *output,
-                           size_t samples) {
+/** @brief Smooth one recovered source sample into the concealed waveform. */
+static int16_t recover_sample(struct rpcr_ring *ring, int16_t sample) {
+  size_t crossfade;
+  size_t index;
+
   if (!ring->plc_samples)
-    return;
-  size_t crossfade =
-      milliseconds_to_samples(ring->output_rate, RPCR_PLC_CROSSFADE_MS);
-  if (crossfade > samples)
-    crossfade = samples;
-  for (size_t index = 0; index < crossfade; ++index) {
-    int16_t synthetic = concealed_sample(ring, ring->plc_samples + index);
-    output[index] = equal_power_mix(synthetic, output[index], index, crossfade);
+    return sample;
+  crossfade = milliseconds_to_samples(ring->output_rate, RPCR_PLC_CROSSFADE_MS);
+  if (!crossfade) {
+    ring->plc_period = 0;
+    ring->plc_samples = 0;
+    return sample;
   }
-  ring->plc_period = 0;
-  ring->plc_samples = 0;
+  if (!ring->recovery_samples)
+    ring->recovery_samples = crossfade;
+  index = crossfade - ring->recovery_samples;
+  sample = equal_power_mix(concealed_sample(ring, ring->plc_samples + index),
+                           sample, index, crossfade);
+  if (!--ring->recovery_samples) {
+    ring->plc_period = 0;
+    ring->plc_samples = 0;
+  }
+  return sample;
+}
+
+/** @brief Refill the consumer-owned converted PCM cache without blocking. */
+static bool refill_output(struct rpcr_ring *ring, size_t target) {
+  const size_t quantum = ring->capacity < 256U ? ring->capacity : 256U;
+  int16_t sample = 0;
+  SRC_DATA data;
+
+  if (ring->output_pending)
+    return true;
+  if (!ring->input_rate || !ring->output_rate || !ring->converter || !quantum)
+    return false;
+  if (ring->input_offset && ring->input_offset + quantum > ring->capacity) {
+    for (size_t index = 0; index < ring->input_pending; ++index)
+      ring->input[index] = ring->input[ring->input_offset + index];
+    ring->input_offset = 0;
+  }
+  while (ring->input_pending < quantum &&
+         rpcr_consumer_pop_sample(ring, &sample)) {
+    ring->input[ring->input_offset + ring->input_pending++] = sample / 32768.0F;
+  }
+  if (!ring->input_pending)
+    return false;
+
+  uint64_t occupancy =
+      (uint64_t)(rpcr_available(ring) + ring->input_pending) * 1000U;
+  if (!ring->occupancy_milli)
+    ring->occupancy_milli = occupancy;
+  else
+    ring->occupancy_milli =
+        (uint64_t)((int64_t)ring->occupancy_milli +
+                   ((int64_t)occupancy - (int64_t)ring->occupancy_milli) / 128);
+  atomic_store_explicit(&ring->filtered_occupancy_milli, ring->occupancy_milli,
+                        memory_order_relaxed);
+  double nominal = (double)ring->output_rate / (double)ring->input_rate;
+  double error =
+      target ? ((double)ring->occupancy_milli - (double)target * 1000.0) /
+                   ((double)target * 1000.0)
+             : 0.0;
+  if (error > 1.0)
+    error = 1.0;
+  ring->ratio += ring->ratio
+                     ? (nominal * (1.0 - error * 0.001) - ring->ratio) / 512.0
+                     : nominal;
+  atomic_store_explicit(&ring->ratio_correction_ppm,
+                        (int)lround((ring->ratio / nominal - 1.0) * 1000000.0),
+                        memory_order_relaxed);
+  data = (SRC_DATA){.data_in = ring->input + ring->input_offset,
+                    .data_out = ring->output,
+                    .input_frames = (long)ring->input_pending,
+                    .output_frames = (long)quantum,
+                    .src_ratio = ring->ratio};
+  if (src_process(ring->converter, &data) || data.input_frames_used < 0 ||
+      data.input_frames_used > (long)ring->input_pending ||
+      data.output_frames_gen <= 0 || data.output_frames_gen > (long)quantum)
+    return false;
+  ring->input_offset += (size_t)data.input_frames_used;
+  ring->input_pending -= (size_t)data.input_frames_used;
+  if (!ring->input_pending)
+    ring->input_offset = 0;
+  ring->output_offset = 0;
+  ring->output_pending = (size_t)data.output_frames_gen;
+  return true;
 }
 
 int rpcr_init(struct rpcr_ring *ring, size_t capacity,
@@ -215,24 +293,37 @@ void rpcr_destroy(struct rpcr_ring *ring) {
   *ring = (struct rpcr_ring){0};
 }
 
-void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples) {
+bool rpcr_producer_push_sample(struct rpcr_ring *ring, int16_t sample) {
+  if (!ring || !ring->storage || !ring->capacity)
+    return false;
   uint64_t written = atomic_load_explicit(&ring->written, memory_order_relaxed);
   uint64_t read = atomic_load_explicit(&ring->read, memory_order_acquire);
-  size_t available = written - read < ring->capacity ? (size_t)(written - read)
-                                                     : ring->capacity;
-  size_t original = samples;
-  if (samples > ring->capacity) {
-    input += samples - ring->capacity;
-    samples = ring->capacity;
+  if (written - read >= ring->capacity) {
+    atomic_fetch_add_explicit(&ring->discarded, 1, memory_order_relaxed);
+    return false;
   }
-  size_t free_samples = ring->capacity - available;
-  size_t overwritten = samples > free_samples ? samples - free_samples : 0;
-  for (size_t i = 0; i < samples; ++i)
-    ring->storage[(written + i) % ring->capacity] = input[i];
-  atomic_store_explicit(&ring->written, written + samples,
-                        memory_order_release);
-  atomic_fetch_add_explicit(&ring->discarded, original - samples + overwritten,
-                            memory_order_relaxed);
+  ring->storage[written % ring->capacity] = sample;
+  atomic_store_explicit(&ring->written, written + 1U, memory_order_release);
+  return true;
+}
+
+bool rpcr_consumer_pop_sample(struct rpcr_ring *ring, int16_t *sample) {
+  if (!ring || !sample || !ring->storage || !ring->capacity)
+    return false;
+  uint64_t read = atomic_load_explicit(&ring->read, memory_order_relaxed);
+  uint64_t written = atomic_load_explicit(&ring->written, memory_order_acquire);
+  if (read == written || written - read > ring->capacity)
+    return false;
+  *sample = ring->storage[read % ring->capacity];
+  atomic_store_explicit(&ring->read, read + 1U, memory_order_release);
+  return true;
+}
+
+void rpcr_write(struct rpcr_ring *ring, const int16_t *input, size_t samples) {
+  if (!ring || !input)
+    return;
+  for (size_t index = 0; index < samples; ++index)
+    (void)rpcr_producer_push_sample(ring, input[index]);
 }
 
 int rpcr_set_sample_rate(struct rpcr_ring *ring, unsigned int sample_rate) {
@@ -241,14 +332,17 @@ int rpcr_set_sample_rate(struct rpcr_ring *ring, unsigned int sample_rate) {
 
 int rpcr_set_rates(struct rpcr_ring *ring, unsigned int input_rate,
                    unsigned int output_rate) {
-  if (!ring || !input_rate || !output_rate)
+  if (!ring || !ring->converter || !input_rate || !output_rate)
     return -1;
   ring->input_rate = input_rate;
   ring->output_rate = output_rate;
   ring->occupancy_milli = 0;
   ring->ratio = 0.0;
+  ring->input_offset = ring->input_pending = 0;
+  ring->output_offset = ring->output_pending = 0;
   ring->plc_period = 0;
   ring->plc_samples = 0;
+  ring->recovery_samples = 0;
   src_reset(ring->converter);
   return 0;
 }
@@ -306,69 +400,38 @@ void rpcr_record_shortfall(struct rpcr_ring *ring, size_t missing,
                         memory_order_relaxed);
 }
 
+bool rpcr_consumer_render_sample(struct rpcr_ring *ring, int16_t *output,
+                                 size_t target) {
+  if (!ring || !output)
+    return false;
+  atomic_store_explicit(&ring->target_samples, target, memory_order_relaxed);
+  if (!refill_output(ring, target)) {
+    conceal_output(ring, output, 1);
+    rpcr_record_shortfall(ring, 1, 1, ring->output_rate);
+    return false;
+  }
+  src_float_to_short_array(ring->output + ring->output_offset++, output, 1);
+  --ring->output_pending;
+  if (!ring->output_pending)
+    ring->output_offset = 0;
+  output[0] = recover_sample(ring, output[0]);
+  remember_output(ring, output, 1);
+  rpcr_record_shortfall(ring, 0, 1, ring->output_rate);
+  return true;
+}
+
 size_t rpcr_render(struct rpcr_ring *ring, int16_t *output, size_t samples,
                    size_t reserve, size_t target) {
-  uint64_t read = atomic_load_explicit(&ring->read, memory_order_relaxed);
-  uint64_t written = atomic_load_explicit(&ring->written, memory_order_acquire);
-  size_t available = written - read < ring->capacity ? (size_t)(written - read)
-                                                     : ring->capacity;
+  if (!ring || !output)
+    return 0;
   atomic_store_explicit(&ring->reserve_samples, reserve, memory_order_relaxed);
-  atomic_store_explicit(&ring->target_samples, target, memory_order_relaxed);
-  /* Do not start a clock-recovery stream from one short burst. */
-  if (!ring->primed && available >= target)
-    ring->primed = true;
-  if (!ring->input_rate || !ring->output_rate || !ring->primed ||
-      samples > ring->capacity || available <= reserve) {
+  if (samples > ring->capacity) {
     conceal_output(ring, output, samples);
     return 0;
   }
-  size_t input_count = available - reserve;
-  /* Bound each callback in source samples.  The factor retains libsamplerate
-   * history while supporting downsampling as well as nominal upsampling. */
-  double nominal = (double)ring->output_rate / (double)ring->input_rate;
-  size_t maximum_input = (size_t)ceil((double)samples / nominal) * 2U;
-  if (maximum_input < 256) {
-    maximum_input = 256;
-  }
-  if (input_count > maximum_input)
-    input_count = maximum_input;
-  for (size_t i = 0; i < input_count; ++i)
-    ring->input[i] = ring->storage[(read + i) % ring->capacity] / 32768.0F;
-  /* Cascaded slow controls avoid callback-rate pitch modulation. */
-  uint64_t occupancy = (uint64_t)available * 1000U;
-  if (!ring->occupancy_milli) {
-    ring->occupancy_milli = occupancy;
-  } else {
-    ring->occupancy_milli =
-        (uint64_t)((int64_t)ring->occupancy_milli +
-                   ((int64_t)occupancy - (int64_t)ring->occupancy_milli) / 128);
-  }
-  atomic_store_explicit(&ring->filtered_occupancy_milli, ring->occupancy_milli,
-                        memory_order_relaxed);
-  double error = target ? ((double)((int64_t)ring->occupancy_milli -
-                                    (int64_t)target * 1000)) /
-                              ((double)target * 1000.0)
-                        : 0.0;
-  if (error > 1.0)
-    error = 1.0;
-  double desired = nominal * (1.0 - error * 0.001);
-  ring->ratio += ring->ratio ? (desired - ring->ratio) / 512.0 : nominal;
-  atomic_store_explicit(&ring->ratio_correction_ppm,
-                        (int)lround((ring->ratio / nominal - 1.0) * 1000000.0),
-                        memory_order_relaxed);
-  SRC_DATA data = {.data_in = ring->input,
-                   .data_out = ring->output,
-                   .input_frames = (long)input_count,
-                   .output_frames = (long)samples,
-                   .src_ratio = ring->ratio};
-  if (src_process(ring->converter, &data))
-    data.input_frames_used = data.output_frames_gen = 0;
-  atomic_store_explicit(&ring->read, read + (uint64_t)data.input_frames_used,
-                        memory_order_release);
-  src_float_to_short_array(ring->output, output, (int)data.output_frames_gen);
-  recover_output(ring, output, (size_t)data.output_frames_gen);
-  remember_output(ring, output, (size_t)data.output_frames_gen);
-  conceal_output(ring, output + data.output_frames_gen,
-                 samples - (size_t)data.output_frames_gen);
-  return (size_t)data.output_frames_gen;
+  size_t rendered = 0;
+  for (size_t index = 0; index < samples; ++index)
+    if (rpcr_consumer_render_sample(ring, output + index, target))
+      ++rendered;
+  return rendered;
 }
