@@ -196,7 +196,7 @@ static bool refill_output(struct rpcr_ring *ring, size_t target) {
 
   if (ring->output_pending)
     return true;
-  if (!ring->input_rate || !ring->output_rate || !ring->converter || !quantum)
+  if (!ring->input_rate || !ring->output_rate || !ring->converter)
     return false;
   if (ring->input_offset && ring->input_offset + quantum > ring->capacity) {
     for (size_t index = 0; index < ring->input_pending; ++index)

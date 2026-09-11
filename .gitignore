@@ -1,1 +1,8 @@
 /build/
+*.gcov
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/librate-adjusting-pcm-ring1/
+/debian/librate-adjusting-pcm-ring-dev/
+/debian/*.substvars

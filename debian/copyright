@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: rate_adjusting_pcm_ring
+Source: https://github.com/cpeter1207/rate_adjusting_pcm_ring
+
+Files: *
+Copyright: 2026 Chris Peterson and rate_adjusting_pcm_ring contributors
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of the GNU General Public License version 2.
+ .
+ On Debian systems, the complete text is available in
+ /usr/share/common-licenses/GPL-2.

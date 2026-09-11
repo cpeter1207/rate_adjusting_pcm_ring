@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+test_dir=$(mktemp -d)
+trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
+
+pkg-config --cflags --libs rate_adjusting_pcm_ring | \
+    xargs cc -std=c11 -Wall -Wextra -Werror tests/test_consumer.c \
+        -o "$test_dir/consumer"
+"$test_dir/consumer"
+
+test -z "$(find /usr/lib -type f -name 'librate_adjusting_pcm_ring.a' -print -quit)"

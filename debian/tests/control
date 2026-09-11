@@ -1,0 +1,2 @@
+Test-Command: sh debian/tests/install-check
+Depends: @, build-essential, pkg-config
