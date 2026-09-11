@@ -1,0 +1,3 @@
+usr/include/rate_adjusting_pcm_ring/rate_adjusting_pcm_ring.h
+usr/lib/*/librate_adjusting_pcm_ring.so
+usr/lib/*/pkgconfig/rate_adjusting_pcm_ring.pc

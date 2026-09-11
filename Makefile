@@ -13,7 +13,7 @@ TEST := tests/test_ring.c
 CONSUMER_TEST := tests/test_consumer.c
 # The public ring structure gained consumer staging state in the per-sample
 # API, so development artifacts deliberately carry the new ABI major.
-VERSION ?= 1.0.0-dev
+VERSION ?= 1.0.1-dev
 LIB_VERSION := $(VERSION)
 LIB_SOVERSION := $(word 1,$(subst ., ,$(LIB_VERSION)))
 LIB_SHARED := build/librate_adjusting_pcm_ring.so.$(LIB_VERSION)
@@ -23,8 +23,15 @@ DESTDIR ?=
 LIBDIR ?= $(prefix)/lib
 PC_TEMPLATE := rate_adjusting_pcm_ring.pc.in
 PC_FILE := build/rate_adjusting_pcm_ring.pc
+DEBIAN_VERSION = $(shell dpkg-parsechangelog -S Version)
+DEBIAN_ARCH = $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEBIAN_MULTIARCH = $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+DEBIAN_OUTPUT_DIR = $(abspath $(CURDIR)/..)
+DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring1_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_STAGE = build/debian-package-stage
 
-.PHONY: all quality lint static-analysis docs test coverage install install-check distcheck platform-verify ci clean FORCE
+.PHONY: all quality lint static-analysis docs test coverage install install-check debian-package-check distcheck platform-verify ci clean FORCE
 all: build/librate_adjusting_pcm_ring.a $(LIB_SHARED) $(LIB_SONAME) build/librate_adjusting_pcm_ring.so
 build:
 	mkdir -p $@
@@ -49,6 +56,7 @@ build/test_ring: $(TEST) $(SOURCE) $(HEADER) | build
 quality: lint static-analysis docs
 lint:
 	clang-format --dry-run --Werror $(SOURCE) $(HEADER) $(TEST) $(CONSUMER_TEST)
+	shellcheck debian/tests/install-check
 static-analysis:
 	cppcheck $(CPPHECK_EXHAUSTIVE) --force --enable=warning,style,performance,portability --error-exitcode=1 --std=c11 -Iinclude $(SOURCE) $(TEST) $(CONSUMER_TEST)
 	clang-tidy $(SOURCE) --warnings-as-errors='*' -- -std=c11 -Iinclude
@@ -78,15 +86,35 @@ install-check: all
 		$$(PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/build/stage pkg-config --cflags --libs rate_adjusting_pcm_ring) \
 		-Wl,-rpath,$(CURDIR)/build/stage/usr/lib -o build/test_consumer
 	./build/test_consumer
+debian-package-check:
+	chmod 0644 debian/changelog debian/control debian/copyright debian/*.docs debian/*.install debian/source/* debian/tests/*
+	chmod 0755 debian/rules
+	dpkg-buildpackage -us -uc -b
+	test -f "$(DEBIAN_RUNTIME_DEB)"
+	test -f "$(DEBIAN_DEV_DEB)"
+	rm -rf $(DEBIAN_STAGE)
+	mkdir -p $(DEBIAN_STAGE)
+	dpkg-deb --extract "$(DEBIAN_RUNTIME_DEB)" $(DEBIAN_STAGE)
+	dpkg-deb --extract "$(DEBIAN_DEV_DEB)" $(DEBIAN_STAGE)
+	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librate_adjusting_pcm_ring.a"
+	test -L "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librate_adjusting_pcm_ring.so"
+	PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) $(CC) $(WARNINGS) $(CONSUMER_TEST) \
+		$$(PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) pkg-config --cflags --libs rate_adjusting_pcm_ring) \
+		-Wl,-rpath,$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH) -o $(DEBIAN_STAGE)/test_consumer
+	$(DEBIAN_STAGE)/test_consumer
 distcheck: install-check
 	rm -rf build/distcheck
 	mkdir -p build/distcheck/rate_adjusting_pcm_ring-$(VERSION)
-	cp -a Makefile Doxyfile README.md QUALITY.md AGENTS.md $(PC_TEMPLATE) include src tests build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/
+	cp -a Makefile Doxyfile README.md QUALITY.md AGENTS.md $(PC_TEMPLATE) debian include src tests build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/
+	chmod 0644 build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/changelog build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/control build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/copyright build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/*.docs build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/*.install build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/source/* build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/tests/*
+	chmod 0755 build/distcheck/rate_adjusting_pcm_ring-$(VERSION)/debian/rules
 	tar -C build/distcheck -czf build/rate_adjusting_pcm_ring-$(VERSION).tar.gz rate_adjusting_pcm_ring-$(VERSION)
 	rm -rf build/distcheck/unpacked
 	mkdir -p build/distcheck/unpacked
 	tar -C build/distcheck/unpacked -xzf build/rate_adjusting_pcm_ring-$(VERSION).tar.gz
-	$(MAKE) -C build/distcheck/unpacked/rate_adjusting_pcm_ring-$(VERSION) install-check
+	$(MAKE) -C build/distcheck/unpacked/rate_adjusting_pcm_ring-$(VERSION) debian-package-check
+	# Do not let nested coverage metadata affect a later top-level coverage run.
+	$(MAKE) -C build/distcheck/unpacked/rate_adjusting_pcm_ring-$(VERSION) clean
 platform-verify: coverage install-check distcheck
 ci: quality platform-verify
 clean:

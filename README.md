@@ -82,4 +82,32 @@ This installs `librate_adjusting_pcm_ring` and its public header under
 `/usr/local` by default. Set `prefix` or `DESTDIR` for packaging. Generated API
 documentation is in `build/doxygen/html/index.html` after `make docs`.
 
+## Debian packages
+
+The Debian source package builds an ABI-major runtime package and its matching
+development package:
+
+- `librate-adjusting-pcm-ring1` contains the versioned shared object.
+- `librate-adjusting-pcm-ring-dev` contains the public header, pkg-config
+  metadata, and unversioned linker symlink.
+
+The development package deliberately does not ship a static archive. Build the
+packages on Debian with:
+
+```sh
+sudo apt install build-essential debhelper libsamplerate0-dev pkg-config
+dpkg-buildpackage -us -uc -b
+```
+
+`make distcheck` verifies the unpacked source archive can build those packages,
+extracts both packages into a staging root, confirms the static archive is
+absent, and compiles and runs an installed shared-library consumer.
+
+## Release versioning
+
+The development build defaults to `1.0.1-dev`. Release automation passes the
+version from its `v1.0.1` tag as `VERSION=1.0.1`; the first version component
+remains the shared-library SONAME, so this packaging-only release continues to
+install `librate_adjusting_pcm_ring.so.1`.
+
 The project is licensed under GPL-2.0-only.

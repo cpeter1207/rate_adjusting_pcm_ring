@@ -1,0 +1,2 @@
+# Keep local build and coverage output out of Debian source diffs.
+extend-diff-ignore = "(^|/)(build|\.debhelper)($|/)|\.(gcda|gcno|gcov)$"

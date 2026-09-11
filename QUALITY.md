@@ -8,7 +8,8 @@ native GitHub matrix before merge or release. The gate requires:
 - Doxygen without warnings;
 - 100% line and branch coverage;
 - static/shared-library build, staged install, installed-consumer, and
-  unpacked-source-archive tests;
+  unpacked-source-archive tests, including a Debian runtime/development
+  package split and extracted-package shared-library consumer check;
 - Debian 12 and 13 on native amd64 and arm64 runners.
 
 The real-time API remains allocation-free and lock-free after initialization.

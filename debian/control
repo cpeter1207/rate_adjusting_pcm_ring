@@ -1,0 +1,24 @@
+Source: rate-adjusting-pcm-ring
+Section: libs
+Priority: optional
+Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), libsamplerate0-dev, pkg-config
+Standards-Version: 4.7.2
+Homepage: https://github.com/cpeter1207/rate_adjusting_pcm_ring
+Rules-Requires-Root: no
+
+Package: librate-adjusting-pcm-ring1
+Architecture: any
+Multi-Arch: same
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: lock-free rate-adjusting PCM playout ring
+ Shared library for a single-producer/single-consumer signed PCM ring with
+ persistent libsamplerate clock recovery and bounded packet-loss concealment.
+
+Package: librate-adjusting-pcm-ring-dev
+Architecture: any
+Multi-Arch: same
+Depends: ${misc:Depends}, librate-adjusting-pcm-ring1 (= ${binary:Version}), libsamplerate0-dev
+Description: development files for the rate-adjusting PCM playout ring
+ Header and pkg-config metadata for applications that link dynamically against
+ the ABI-major 1 rate-adjusting PCM playout ring.
