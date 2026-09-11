@@ -8,9 +8,15 @@ constraints but must not weaken it.
 
 Run platform-independent formatting, lint, static analysis—including
 Cppcheck—and Doxygen once, concurrently where independent. Do not run Cppcheck
-in each platform job. Run platform-dependent tests, coverage, build, packaging,
-and staged-install checks concurrently across Debian 12 and 13 on native amd64
-and arm64. Quality checks must not rewrite source files.
+in each platform job. Run platform-dependent build, tests, packaging, and
+staged-install checks concurrently on native Debian 13 amd64 and arm64. Require
+100% line and branch coverage of production code only on Debian 13 amd64; test
+code is excluded from the coverage requirement. Debian 12 support is
+aspirational: do not run automated Debian 12 tests or build Debian 12 packages
+as part of ordinary pushes, pull requests, or releases. Build Debian 12
+packages manually only when explicitly requested. Automated releases publish
+Debian 13 packages only; node installations use Debian 13 arm64 packages.
+Quality checks must not rewrite source files.
 
 Complete the full quality gate before pushing, opening or updating a pull
 request, merging, tagging, or releasing. Local recovery commits may follow
@@ -18,8 +24,9 @@ affected targeted checks, but must not be represented as fully verified or used
 for a push, pull request, merge, tag, or release until the full gate passes.
 Treat compiler warnings as errors and fail applicable formatting, Ruff,
 ShellCheck, Cppcheck, Clang-Tidy, Doxygen, tests, installation checks, and 100%
-line and branch coverage. Remove unreachable or dead code instead of
-suppressing diagnostics or excluding it from coverage.
+line and branch coverage of production code on Debian 13 amd64. Remove
+unreachable or dead code instead of suppressing diagnostics or excluding it
+from coverage.
 
 Update concise Doxygen comments, tests, user documentation, examples, and
 build, install, and package artifacts whenever an interface changes. Consumers
