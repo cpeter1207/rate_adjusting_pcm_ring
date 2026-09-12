@@ -14,7 +14,12 @@ C compatibility source must each have 100% line and branch coverage on Debian
 
 The ring's quality container is a disposable, labeled container. Its launcher
 first removes only stopped stale containers with the exact project and workspace
-labels, then removes its own container on every exit path. Doxygen generates
+labels, then removes its own container on every exit path. `make container-ci`
+explicitly passes the Docker socket so `autopkgtest` can create a second,
+project-owned Debian 13 testbed. The normal launcher path and
+`container-coverage` remain socket-free. The package recipe removes only nested
+testbeds carrying its exact project and `autopkgtest` scope labels before and
+after each run. Doxygen generates
 the public C ABI and Rust declaration references; the documentation generator
 fails when a production Rust declaration lacks a Doxygen comment. Rustdoc
 supplements that reference, and the source build leaves publication to release

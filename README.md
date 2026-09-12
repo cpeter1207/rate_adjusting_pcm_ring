@@ -61,11 +61,15 @@ make test
 
 `make ci` runs formatting, static analysis, Doxygen, Rust documentation,
 tests, staged installation, Debian package and autopkgtest checks, archive
-checks, and production-code line and branch coverage. Doxygen generation
+checks, and production-code line and branch coverage. `make container-ci`
+builds the project quality image and runs the complete gate through its labeled
+disposable container. The package test runs inside a separate disposable
+project-owned Debian 13 testbed; the Docker socket is passed only by
+`container-ci`. Doxygen generation
 checks documented production Rust items and embeds complete source context;
 Rustdoc publishes the symbol-level reference, including private implementation
-items. `make container-coverage` starts and removes a disposable quality container
-deterministically through `tools/run-in-quality-container.sh`.
+items. `make container-coverage` starts and removes a socket-free disposable
+quality container deterministically through `tools/run-in-quality-container.sh`.
 
 For a locally staged adapter rather than an installed package, pass its paths:
 

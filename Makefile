@@ -73,6 +73,11 @@ DEBIAN_V1_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring1_$(DEBIA
 DEBIAN_V1_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_STAGE = build/debian-package-stage
 AUTOPKGTEST_DIR = build/autopkgtest
+# Use the project-owned Debian 13 quality base as an isolated package-test
+# testbed.  The derived quality image remains the build environment.
+AUTOPKGTEST_TESTBED_IMAGE ?= $(QUALITY_BASE_IMAGE)
+AUTOPKGTEST_PROJECT_LABEL = org.rptadvanced.test.project=$(PACKAGE)
+AUTOPKGTEST_SCOPE_LABEL = org.rptadvanced.test.scope=autopkgtest
 COVERAGE_TOOLCHAIN ?= nightly-2025-02-20
 COVERAGE_DIR = build/coverage
 COVERAGE_TARGET_DIR = build/llvm-cov-target
@@ -94,7 +99,7 @@ C_WARNINGS = -std=c11 -Wall -Wextra -Wpedantic -Werror
 
 
 .PHONY: all compat-test compat-coverage quality lint static-analysis docs test coverage install adapter-debs install-check \
-	debian-package-check autopkgtest dist distcheck platform-verify ci quality-image container-coverage clean FORCE
+	debian-package-check autopkgtest dist distcheck platform-verify ci quality-image container-ci container-coverage clean FORCE
 
 all: $(V1_LIBRARY_VERSIONED) $(V1_LIBRARY_SONAME) $(V1_LIBRARY_LINK) \
 	$(LIBRARY_VERSIONED) $(LIBRARY_SONAME) $(LIBRARY_LINK)
@@ -320,11 +325,24 @@ debian-package-check: dist adapter-debs
 autopkgtest: debian-package-check adapter-debs
 	rm -rf $(AUTOPKGTEST_DIR)
 	mkdir -p $(AUTOPKGTEST_DIR)
-	$(AUTOPKGTEST) --output-dir $(AUTOPKGTEST_DIR) \
+	set -eu; \
+	cleanup() { \
+		docker container ls --all --quiet --filter 'label=rpt_advanced.test=true' \
+			--filter 'label=$(AUTOPKGTEST_PROJECT_LABEL)' \
+			--filter 'label=$(AUTOPKGTEST_SCOPE_LABEL)' | \
+			xargs -r docker container rm --force >/dev/null 2>&1 || true; \
+	}; \
+	cleanup; \
+	trap 'status=$$?; cleanup; exit $$status' EXIT; \
+	$(AUTOPKGTEST) -U --output-dir $(AUTOPKGTEST_DIR) \
 		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb') \
 		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb') \
 		$(DEBIAN_V1_RUNTIME_DEB) $(DEBIAN_V1_DEV_DEB) \
-		$(DEBIAN_RUNTIME_DEB) $(DEBIAN_DEV_DEB) . -- null
+		$(DEBIAN_RUNTIME_DEB) $(DEBIAN_DEV_DEB) . -- \
+		docker --no-init $(AUTOPKGTEST_TESTBED_IMAGE) \
+		--label rpt_advanced.test=true \
+		--label $(AUTOPKGTEST_PROJECT_LABEL) \
+		--label $(AUTOPKGTEST_SCOPE_LABEL)
 
 dist: | build
 	rm -rf build/dist
@@ -361,6 +379,8 @@ quality-image:
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb' | wc -l)" -eq 1
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb' | wc -l)" -eq 1
 	docker image pull $(QUALITY_BASE_IMAGE)
+	test "$(AUTOPKGTEST_TESTBED_IMAGE)" = "$(QUALITY_BASE_IMAGE)" || \
+		docker image pull $(AUTOPKGTEST_TESTBED_IMAGE)
 	base_image=$$(docker image inspect --format '{{index .RepoDigests 0}}' $(QUALITY_BASE_IMAGE)); \
 	test -n "$$base_image" && test "$$base_image" != '<no value>'; \
 	docker build --pull --build-context samplerate_adapter_debs=$(abspath $(SAMPLERATE_ADAPTER_DEB_DIR)) \
@@ -369,6 +389,12 @@ quality-image:
 
 container-coverage: quality-image
 	RPTADV_CONTAINER_PULL=0 sh $(QUALITY_LAUNCHER) $(QUALITY_IMAGE) $(MAKE) coverage
+
+# Only the complete package gate needs nested Docker for autopkgtest.  Keep
+# coverage and targeted quality commands socket-free by default.
+container-ci: quality-image
+	RPTADV_CONTAINER_PULL=0 RPTADV_CONTAINER_DOCKER_SOCKET=1 \
+		sh $(QUALITY_LAUNCHER) $(QUALITY_IMAGE) $(MAKE) ci
 
 clean:
 	rm -rf build target

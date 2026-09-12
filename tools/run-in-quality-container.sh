@@ -16,7 +16,16 @@ project_label='org.rptadvanced.test.project=rate-adjusting-pcm-ring'
 scope_label="org.rptadvanced.test.scope=$scope"
 name="rate-adjusting-pcm-ring-test-$scope-$$"
 pull_image=${RPTADV_CONTAINER_PULL:-1}
+pass_docker_socket=${RPTADV_CONTAINER_DOCKER_SOCKET:-0}
 lock_dir="$root/.work/quality-container.lock"
+
+case $pass_docker_socket in
+	0|1) ;;
+	*)
+		printf '%s\n' 'RPTADV_CONTAINER_DOCKER_SOCKET must be 0 or 1' >&2
+		exit 2
+		;;
+esac
 
 cleanup_stale()
 {
@@ -74,6 +83,14 @@ case $(uname -s) in
 		;;
 esac
 
-docker run --rm --name "$name" --label rpt_advanced.test=true \
-	--label "$project_label" --label "$scope_label" \
-	--volume "$host_root:/workspace" --workdir /workspace "$image_ref" "$@"
+if [ "$pass_docker_socket" = '1' ]; then
+	docker run --rm --name "$name" --label rpt_advanced.test=true \
+		--label "$project_label" --label "$scope_label" \
+		--volume "$host_root:/workspace" \
+		--volume /var/run/docker.sock:/var/run/docker.sock \
+		--workdir /workspace "$image_ref" "$@"
+else
+	docker run --rm --name "$name" --label rpt_advanced.test=true \
+		--label "$project_label" --label "$scope_label" \
+		--volume "$host_root:/workspace" --workdir /workspace "$image_ref" "$@"
+fi

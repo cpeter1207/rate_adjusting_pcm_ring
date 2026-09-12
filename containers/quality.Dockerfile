@@ -13,7 +13,7 @@ ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:${PATH}
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		autopkgtest ca-certificates cargo curl debhelper dpkg-dev pkg-config rustc && \
+		autopkgtest ca-certificates cargo curl debhelper docker-cli dpkg-dev iproute2 pkg-config rustc && \
 	rm -rf /var/lib/apt/lists/*
 
 COPY --from=samplerate_adapter_debs librptadv-samplerate-adapter1_*.deb /tmp/rptadv-samplerate-adapter/
