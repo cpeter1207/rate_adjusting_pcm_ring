@@ -2,11 +2,19 @@
 set -eu
 
 test_dir=$(mktemp -d)
-trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
+trap 'rm -rf "$test_dir"' 0 HUP INT TERM
+
+pkg-config --exists rate_adjusting_pcm_ring
+pkg-config --exists rate_adjusting_pcm_ring2
 
 pkg-config --cflags --libs rate_adjusting_pcm_ring | \
     xargs cc -std=c11 -Wall -Wextra -Werror tests/test_consumer.c \
-        -o "$test_dir/consumer"
-"$test_dir/consumer"
+        -o "$test_dir/consumer-smoke-abi1"
+"$test_dir/consumer-smoke-abi1"
 
-test -z "$(find /usr/lib -type f -name 'librate_adjusting_pcm_ring.a' -print -quit)"
+pkg-config --cflags --libs rate_adjusting_pcm_ring2 | \
+    xargs cc -std=c11 -Wall -Wextra -Werror tests/descriptor_smoke.c \
+        -o "$test_dir/descriptor-smoke"
+"$test_dir/descriptor-smoke"
+
+test -z "$(find /usr/lib -type f \( -name 'librate_adjusting_pcm_ring.a' -o -name 'librate_adjusting_pcm_ring2.a' \) -print -quit)"

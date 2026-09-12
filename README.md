@@ -1,113 +1,103 @@
-# rate_adjusting_pcm_ring
+# rate-adjusting-pcm-ring
 
-Lock-free, single-producer/single-consumer PCM playout ring with persistent
-libsamplerate clock recovery for real-time audio callbacks.
+`rate-adjusting-pcm-ring` is the shared lock-free single-producer,
+single-consumer playout ring for the rpt_advanced project. ABI major two is a
+Rust dynamic shared object with an opaque C handle and canonical mono F32 PCM
+in the normalized range `-1.0` through `+1.0`.
 
-The producer publishes signed 16-bit mono PCM without waiting. The consumer
-uses available PCM immediately and drives one persistent libsamplerate
-converter with a deliberately slow occupancy-derived ratio. The target
-occupancy steers that ratio; it is not a playout-start threshold. This corrects
-independent clocks without callback-rate pitch modulation or periodic
-buffer-adjustment artifacts.
+The producer never waits or overwrites unread PCM. The consumer owns one
+persistent dynamic sample-rate adapter, uses source PCM as soon as it is
+available, and applies a slow occupancy-driven ratio correction for clock
+drift. Reserve and target values are diagnostic and controller inputs, not
+startup gates. Brief output shortfalls use bounded pitch-period continuation
+with equal-power entry and recovery transitions; sustained loss fades out.
 
-The producer never overwrites PCM that the consumer has not released. If the
-ring fills, it publishes the leading portion that fits and drops the remaining
-incoming samples; the public `discarded` counter records those drops. This
-preserves strict single-producer/single-consumer ownership and chronological
-playout without locks or allocation in either audio operation.
+ABI major two dynamically links `librptadv_samplerate_adapter.so.1`, the
+separately versioned project adapter. The frozen ABI-major-one compatibility
+object is a narrow C forwarding facade over that Rust implementation; it
+dynamically links ABI major two and retains its released S16 symbols, layout,
+and SONAME. Neither ABI ships a static archive.
 
-On a source shortfall, the consumer retains recent real PCM and uses bounded
-pitch-period continuation with entry and recovery crossfades. This conceals a
-brief gap without blocking or allocating in either audio operation; sustained
-loss fades to silence instead of repeating speech indefinitely. Call
-`rpcr_set_sample_rate()` before rendering so the concealer uses the active PCM
-rate.  Call `rpcr_set_rates()` before rendering when producer and consumer
-rates differ; its single persistent converter performs both nominal conversion
-and clock correction.  `rpcr_set_sample_rate()` remains a shorthand for a
-same-rate ring.
+## ABI and migration
 
-## API and compatibility
+ABI major one is frozen for current S16 USBRadioPlus and rpt_advanced
+consumers and is built alongside ABI major two. Its released compatibility
+artifacts are:
 
-The real-time API is sample-at-a-time:
+- runtime library: `librate_adjusting_pcm_ring.so.1` (SONAME)
+- runtime package: `librate-adjusting-pcm-ring1`
+- development package: `librate-adjusting-pcm-ring-dev`
+- public header:
+  [`include/rate_adjusting_pcm_ring.h`](include/rate_adjusting_pcm_ring.h)
+- pkg-config module: `rate_adjusting_pcm_ring`
 
-1. Initialize the ring with `rpcr_init()` and set its rates before either
-   endpoint starts.
-2. The sole producer calls `rpcr_producer_push_sample()` for each source PCM
-   sample.
-3. The sole hardware-paced consumer calls
-   `rpcr_consumer_render_sample()` for each requested output sample. It returns
-   `false` and supplies bounded concealment when source PCM is unavailable.
+ABI major two is the new canonical-F32 interface:
 
-`rpcr_consumer_pop_sample()` is available for a consumer that needs raw source
-PCM instead of rate-adjusted output. It and `rpcr_consumer_render_sample()`
-share the same consumer cursor, so a consumer uses one or the other for a
-given ring at a time.
+- runtime library: `librate_adjusting_pcm_ring2.so.2`
+- runtime package: `librate-adjusting-pcm-ring2`
+- development package: `librate-adjusting-pcm-ring2-dev`
+- public header:
+  [`include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h`](include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h)
+- pkg-config module: `rate_adjusting_pcm_ring2`
 
-The older block calls remain source-compatible: `rpcr_write()` loops over
-`rpcr_producer_push_sample()`, and `rpcr_render()` loops over
-`rpcr_consumer_render_sample()`. Their playout behavior intentionally follows
-the sample API. In particular, `reserve` is retained for diagnostics and
-`target` only steers slow clock recovery; neither reserve, priming, nor target
-occupancy gates playout. The public `primed` member is retained only for source
-compatibility and no longer controls playout.
-
-Version 1 introduces the sample staging state in the public `struct rpcr_ring`
-and therefore has a new shared-library ABI major. Programs built against 0.x
-must be rebuilt and linked with `librate_adjusting_pcm_ring.so.1`; source users
-of the block API can otherwise retain their existing calls.
+The new descriptor owns lifecycle, rendering, observations, and error
+translation. Consumers must migrate from the public ABI-1 structure to the
+opaque ABI-2 descriptor; they must dynamically link a released v2 package.
+If an ABI-1 rate reset fails in the required dynamic adapter, the facade
+returns an error rather than continuing with stale converter state.
+Its private `rpcr1_bridge_descriptor` is solely the implementation contract
+between the two installed shared objects; it is not a supported consumer ABI.
 
 ## Build and verify
 
-Debian build prerequisites are a C11 compiler, GNU Make, libsamplerate headers,
-Clang tools, Cppcheck, Doxygen, and Gcovr. Build and run the full local gate:
+Install a compatible `librptadv-samplerate-adapter-dev` package (currently
+`0.1.0~alpha1` or newer), then run:
 
 ```sh
-make ci
+make
+make lint static-analysis
+make test
 ```
 
-The gate builds static and shared libraries, runs unit and installed-consumer
-tests, verifies the unpacked source archive, requires zero diagnostics from
-formatting, Cppcheck, Clang-Tidy, and Doxygen, and enforces 100% line and
-branch coverage. GitHub runs the platform-dependent portion natively on
-Debian 12 and 13 for amd64 and arm64.
+`make ci` runs formatting, static analysis, Doxygen, Rust documentation,
+tests, staged installation, Debian package and autopkgtest checks, archive
+checks, and production-code line and branch coverage. Doxygen generation
+checks documented production Rust items and embeds complete source context;
+Rustdoc publishes the symbol-level reference, including private implementation
+items. `make container-coverage` starts and removes a disposable quality container
+deterministically through `tools/run-in-quality-container.sh`.
+
+For a locally staged adapter rather than an installed package, pass its paths:
+
+```sh
+make SAMPLERATE_ADAPTER_LIBDIR=/path/to/lib \
+     test
+```
+
+The disposable quality image consumes one already-built, versioned runtime
+adapter package and one matching development package rather than rebuilding or
+vendoring its source. Give their directory explicitly:
+
+```sh
+make SAMPLERATE_ADAPTER_DEB_DIR=/path/to/adapter-debs quality-image
+```
 
 ## Install
 
 ```sh
-make
-sudo make install
+sudo make install PREFIX=/usr/local
+sudo ldconfig
 ```
 
-This installs `librate_adjusting_pcm_ring` and its public header under
-`/usr/local` by default. Set `prefix` or `DESTDIR` for packaging. Generated API
-documentation is in `build/doxygen/html/index.html` after `make docs`.
+This installs both versioned shared objects, their unversioned development
+linker symlinks, public headers, and pkg-config metadata. ABI major two
+requires the matching sample-rate adapter runtime package; frozen ABI major one
+requires its matching ABI-major-two runtime package.
 
-## Debian packages
+The public C ABI reference and generated Rust declaration reference are in
+`build/doxygen/html/index.html`; Rustdoc supplements them in `target/doc`.
+Source builds generate both trees deterministically. Release automation may
+publish those trees as documentation artifacts; this source repository
+deliberately contains no host-specific publication command.
 
-The Debian source package builds an ABI-major runtime package and its matching
-development package:
-
-- `librate-adjusting-pcm-ring1` contains the versioned shared object.
-- `librate-adjusting-pcm-ring-dev` contains the public header, pkg-config
-  metadata, and unversioned linker symlink.
-
-The development package deliberately does not ship a static archive. Build the
-packages on Debian with:
-
-```sh
-sudo apt install build-essential debhelper libsamplerate0-dev pkg-config
-dpkg-buildpackage -us -uc -b
-```
-
-`make distcheck` verifies the unpacked source archive can build those packages,
-extracts both packages into a staging root, confirms the static archive is
-absent, and compiles and runs an installed shared-library consumer.
-
-## Release versioning
-
-The development build defaults to `1.0.1-dev`. Release automation passes the
-version from its `v1.0.1` tag as `VERSION=1.0.1`; the first version component
-remains the shared-library SONAME, so this packaging-only release continues to
-install `librate_adjusting_pcm_ring.so.1`.
-
-The project is licensed under GPL-2.0-only.
+The project is licensed under [GPL-2.0-only](COPYING).

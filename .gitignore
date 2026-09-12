@@ -1,8 +1,14 @@
 /build/
+/target/
+**/__pycache__/
+*.pyc
+/.work/
 *.gcov
 /debian/.debhelper/
 /debian/debhelper-build-stamp
 /debian/files
 /debian/librate-adjusting-pcm-ring1/
 /debian/librate-adjusting-pcm-ring-dev/
+/debian/librate-adjusting-pcm-ring2/
+/debian/librate-adjusting-pcm-ring2-dev/
 /debian/*.substvars

@@ -2,23 +2,40 @@ Source: rate-adjusting-pcm-ring
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
-Build-Depends: debhelper-compat (= 13), libsamplerate0-dev, pkg-config
+Build-Depends: cargo, debhelper-compat (= 13), librptadv-samplerate-adapter-dev (>= 0.1.0~alpha1), pkg-config, rustc
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/rate_adjusting_pcm_ring
 Rules-Requires-Root: no
 
 Package: librate-adjusting-pcm-ring1
-Architecture: any
+Architecture: amd64 arm64
 Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}
-Description: lock-free rate-adjusting PCM playout ring
- Shared library for a single-producer/single-consumer signed PCM ring with
- persistent libsamplerate clock recovery and bounded packet-loss concealment.
+Depends: ${misc:Depends}, ${shlibs:Depends}, librate-adjusting-pcm-ring2 (= ${binary:Version})
+Description: ABI-compatible S16 facade for the Rust PCM ring
+ Frozen ABI-major-1 shared library for existing USBRadioPlus and rpt_advanced
+ consumers. Its C facade forwards to the Rust-owned rate recovery and bounded
+ packet-loss-concealment implementation in ABI major two.
 
 Package: librate-adjusting-pcm-ring-dev
-Architecture: any
+Architecture: amd64 arm64
 Multi-Arch: same
-Depends: ${misc:Depends}, librate-adjusting-pcm-ring1 (= ${binary:Version}), libsamplerate0-dev
-Description: development files for the rate-adjusting PCM playout ring
- Header and pkg-config metadata for applications that link dynamically against
- the ABI-major 1 rate-adjusting PCM playout ring.
+Depends: ${misc:Depends}, librate-adjusting-pcm-ring1 (= ${binary:Version}), librate-adjusting-pcm-ring2-dev (= ${binary:Version})
+Description: development files for the ABI-compatible S16 PCM facade
+ ABI-major-1 public header and pkg-config metadata for existing dynamic
+ consumers. No static archive is shipped.
+
+Package: librate-adjusting-pcm-ring2
+Architecture: amd64 arm64
+Multi-Arch: same
+Depends: ${misc:Depends}, ${shlibs:Depends}, librptadv-samplerate-adapter1 (>= 0.1.0~alpha1)
+Description: lock-free canonical-F32 rate-adjusting PCM ring
+ Rust shared library for single-producer/single-consumer PCM playout with
+ persistent sample-rate conversion, clock recovery, and bounded concealment.
+
+Package: librate-adjusting-pcm-ring2-dev
+Architecture: amd64 arm64
+Multi-Arch: same
+Depends: ${misc:Depends}, librate-adjusting-pcm-ring2 (= ${binary:Version})
+Description: development files for the F32 rate-adjusting PCM ring
+ Public descriptor header and pkg-config metadata for consumers of the
+ dynamically linked ABI-major-2 canonical-F32 PCM ring.
