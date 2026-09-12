@@ -18,10 +18,14 @@ packages manually only when explicitly requested. Automated releases publish
 Debian 13 packages only; node installations use Debian 13 arm64 packages.
 Quality checks must not rewrite source files.
 
-Complete the full quality gate before pushing, opening or updating a pull
-request, merging, tagging, or releasing. Local recovery commits may follow
-affected targeted checks, but must not be represented as fully verified or used
-for a push, pull request, merge, tag, or release until the full gate passes.
+Before a push, run formatting, lint, and static analysis only; GitHub repeats
+those fast checks for every push. Do not run the full platform gate locally
+solely to prepare a push. The full quality gate runs for every pull request and
+must pass before that pull request can merge. Releases are built only from a
+merged main revision that has already passed the full pull-request gate, so the
+release workflow does not repeat it. Local recovery commits may follow affected
+targeted checks, but must not be represented as fully verified until the pull
+request gate passes.
 Treat compiler warnings as errors and fail applicable formatting, Ruff,
 ShellCheck, Cppcheck, Clang-Tidy, Doxygen, tests, installation checks, and 100%
 line and branch coverage of production code on Debian 13 amd64. Remove
@@ -41,5 +45,5 @@ explicit approval.
 rate_adjusting_pcm_ring uses `make ci` as its complete local quality gate.
 
 The producer and consumer audio operations must remain allocation-free and
-lock-free after `rpcr_init`. Update Doxygen, tests, README, and packaging with
+lock-free after construction. Update Doxygen, tests, README, and packaging with
 every affected public interface.

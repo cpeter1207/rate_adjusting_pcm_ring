@@ -1,2 +1,2 @@
 Test-Command: sh debian/tests/install-check
-Depends: @, build-essential, pkg-config
+Depends: @, librate-adjusting-pcm-ring-dev, librate-adjusting-pcm-ring2-dev, build-essential, pkg-config

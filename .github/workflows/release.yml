@@ -3,6 +3,7 @@ on:
   push:
     tags: ['v*']
 permissions:
+  checks: read
   contents: write
   pages: write
   id-token: write

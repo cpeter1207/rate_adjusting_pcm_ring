@@ -1,5 +1,7 @@
-PROJECT_NAME = rate_adjusting_pcm_ring
-INPUT = README.md include src
+PROJECT_NAME = rate-adjusting-pcm-ring
+PROJECT_BRIEF = Lock-free canonical-F32 rate-adjusting PCM ring
+INPUT = README.md include src/rate_adjusting_pcm_ring.c build/doxygen-input
+FILE_PATTERNS = *.h *.md *.dox
 RECURSIVE = YES
 WARNINGS = YES
 WARN_IF_UNDOCUMENTED = YES

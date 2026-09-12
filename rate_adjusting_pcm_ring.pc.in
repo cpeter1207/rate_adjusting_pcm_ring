@@ -4,8 +4,8 @@ libdir=@LIBDIR@
 includedir=${prefix}/include
 
 Name: rate_adjusting_pcm_ring
-Description: Lock-free rate-adjusting PCM playout ring
+Description: ABI-compatible S16 facade for the Rust PCM playout ring
 Version: @VERSION@
-Requires: samplerate
+Requires: rate_adjusting_pcm_ring2
 Libs: -L${libdir} -lrate_adjusting_pcm_ring
 Cflags: -I${includedir}/rate_adjusting_pcm_ring
