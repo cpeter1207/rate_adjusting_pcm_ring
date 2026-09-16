@@ -21,8 +21,8 @@ const PLC_ANALYSIS_MS: u32 = 5;
 const PLC_CROSSFADE_MS: u32 = 8;
 /// Full-level continuation period before a sustained loss begins fading.
 const PLC_HOLD_MS: u32 = 10;
-/// Maximum continuation duration before silence replaces repeated history.
-const PLC_FADE_MS: u32 = 60;
+/// Crossfade duration after the initial continuation before silence.
+const PLC_FADE_MS: u32 = 10;
 /// Maximum input/output chunk handed to the persistent converter per refill.
 const CONVERTER_QUANTUM: usize = 256;
 /// Smallest workspace that can grow once after a zero-progress SRC call.
@@ -73,7 +73,7 @@ pub(crate) struct Observation {
     pub(crate) capacity_samples: u64,
     /// Source samples currently readable by the consumer.
     pub(crate) available_samples: u64,
-    /// Latest requested retained floor, for diagnostics only.
+    /// Latest caller-selected playout priming floor.
     pub(crate) reserve_samples: u64,
     /// Low-pass filtered source occupancy.
     pub(crate) filtered_occupancy_samples: u64,
@@ -131,6 +131,7 @@ struct ConsumerState {
     zero_progress: bool,
     occupancy_milli: u64,
     ratio: f64,
+    primed: bool,
 }
 
 /// All preallocated payload and consumer workspaces owned by one ring.
@@ -237,6 +238,7 @@ impl Ring {
                 zero_progress: false,
                 occupancy_milli: 0,
                 ratio: 0.0,
+                primed: false,
             }),
         })
     }
@@ -334,6 +336,17 @@ impl Ring {
         let mut real_samples = 0_u64;
         let mut adapter_error = false;
         for sample in output {
+            // A new burst is intentionally held until it has enough lookback
+            // for squelch and DTMF decisions. This is silence, not PLC: no
+            // source PCM has been lost yet.
+            let primed = unsafe { &mut *self.consumer.get() };
+            if !primed.primed {
+                if self.available() < reserve_samples {
+                    *sample = 0.0;
+                    continue;
+                }
+                primed.primed = true;
+            }
             let (rendered, real, errored) = self.consumer_render_sample(target_samples);
             *sample = rendered;
             if real {
@@ -342,6 +355,16 @@ impl Ring {
             adapter_error |= errored;
         }
         (real_samples, adapter_error)
+    }
+
+    /// End the current burst and discard unread/converted pre-edge PCM.
+    pub(crate) fn consumer_reset(&self) -> Result<(), ()> {
+        let written = self.written.load(Ordering::Acquire);
+        self.read.store(written, Ordering::Release);
+        let state = unsafe { &mut *self.consumer.get() };
+        state.reset()?;
+        state.primed = false;
+        Ok(())
     }
 
     /// Return readable producer samples, bounded to the configured capacity.
@@ -397,6 +420,24 @@ impl Ring {
 }
 
 impl ConsumerState {
+    /// Discard an ended burst before the next reserve-prime interval.
+    fn reset(&mut self) -> Result<(), ()> {
+        self.converter.reset()?;
+        self.input_offset = 0;
+        self.input_pending = 0;
+        self.output_offset = 0;
+        self.output_pending = 0;
+        self.history_length = 0;
+        self.history_next = 0;
+        self.plc_period = 0;
+        self.plc_samples = 0;
+        self.recovery_samples = 0;
+        self.zero_progress = false;
+        self.occupancy_milli = 0;
+        self.ratio = 0.0;
+        Ok(())
+    }
+
     /// Refill the converted cache with one bounded persistent SRC operation.
     fn refill_output(&mut self, ring: &Ring, target_samples: u64) -> RefillResult {
         if self.output_pending != 0 {

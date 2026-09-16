@@ -82,6 +82,8 @@ type ProducerPush = extern "C" fn(*mut Rpcr2Ring, *const f32, u64, *mut u64) -> 
 type ConsumerRenderSample = extern "C" fn(*mut Rpcr2Ring, *mut f32, u64, *mut bool) -> c_int;
 /// C function type that renders an arbitrary converted output block.
 type ConsumerRender = extern "C" fn(*mut Rpcr2Ring, *mut f32, u64, u64, u64, *mut u64) -> c_int;
+/// C function type that discards a completed burst before the next prime.
+type ConsumerReset = extern "C" fn(*mut Rpcr2Ring) -> c_int;
 /// C function type that copies a diagnostic snapshot.
 type Observe = extern "C" fn(*const Rpcr2Ring, *mut CObservation) -> c_int;
 
@@ -97,6 +99,7 @@ pub struct Descriptor {
     ring_producer_push: ProducerPush,
     ring_consumer_render_sample: ConsumerRenderSample,
     ring_consumer_render: ConsumerRender,
+    ring_consumer_reset: ConsumerReset,
     ring_observe: Observe,
 }
 
@@ -358,6 +361,18 @@ extern "C" fn ring_consumer_render(
     RESULT_OK
 }
 
+/// Discard a completed burst from the consumer-owned conversion state.
+extern "C" fn ring_consumer_reset(ring: *mut Rpcr2Ring) -> c_int {
+    let ring = match unsafe { checked_ring(ring) } {
+        Ok(ring) => ring,
+        Err(error) => return error,
+    };
+    match ring.ring.consumer_reset() {
+        Ok(()) => RESULT_OK,
+        Err(()) => RESULT_ADAPTER_ERROR,
+    }
+}
+
 /// Copy a lock-free best-effort diagnostic snapshot.
 extern "C" fn ring_observe(ring: *const Rpcr2Ring, observation: *mut CObservation) -> c_int {
     let ring = match unsafe { checked_ring(ring.cast_mut()) } {
@@ -402,6 +417,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_producer_push,
     ring_consumer_render_sample,
     ring_consumer_render,
+    ring_consumer_reset,
     ring_observe,
 };
 
