@@ -10,7 +10,6 @@
 #[cfg(not(target_has_atomic = "64"))]
 compile_error!("rate_adjusting_pcm_ring2 requires lock-free 64-bit atomics");
 
-mod legacy_bridge;
 mod ring;
 mod samplerate_adapter;
 

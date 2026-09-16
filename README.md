@@ -12,26 +12,12 @@ drift. Reserve and target values are diagnostic and controller inputs, not
 startup gates. Brief output shortfalls use bounded pitch-period continuation
 with equal-power entry and recovery transitions; sustained loss fades out.
 
-ABI major two dynamically links `librptadv_samplerate_adapter.so.1`, the
-separately versioned project adapter. The frozen ABI-major-one compatibility
-object is a narrow C forwarding facade over that Rust implementation; it
-dynamically links ABI major two and retains its released S16 symbols, layout,
-and SONAME. Neither ABI ships a static archive.
+The library dynamically links `librptadv_samplerate_adapter.so.1`, the
+separately versioned project adapter. It does not ship a static archive.
 
-## ABI and migration
+## Public ABI
 
-ABI major one is frozen for current S16 USBRadioPlus and rpt_advanced
-consumers and is built alongside ABI major two. Its released compatibility
-artifacts are:
-
-- runtime library: `librate_adjusting_pcm_ring.so.1` (SONAME)
-- runtime package: `librate-adjusting-pcm-ring1`
-- development package: `librate-adjusting-pcm-ring-dev`
-- public header:
-  [`include/rate_adjusting_pcm_ring.h`](include/rate_adjusting_pcm_ring.h)
-- pkg-config module: `rate_adjusting_pcm_ring`
-
-ABI major two is the new canonical-F32 interface:
+ABI major two is the canonical-F32 interface:
 
 - runtime library: `librate_adjusting_pcm_ring2.so.2`
 - runtime package: `librate-adjusting-pcm-ring2`
@@ -40,13 +26,10 @@ ABI major two is the new canonical-F32 interface:
   [`include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h`](include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h)
 - pkg-config module: `rate_adjusting_pcm_ring2`
 
-The new descriptor owns lifecycle, rendering, observations, and error
-translation. Consumers must migrate from the public ABI-1 structure to the
-opaque ABI-2 descriptor; they must dynamically link a released v2 package.
-If an ABI-1 rate reset fails in the required dynamic adapter, the facade
-returns an error rather than continuing with stale converter state.
-Its private `rpcr1_bridge_descriptor` is solely the implementation contract
-between the two installed shared objects; it is not a supported consumer ABI.
+The descriptor owns lifecycle, rendering, observations, and error translation.
+Consumers dynamically link the released ABI-2 package and use its opaque
+handle. The former S16 ABI-major-one facade and its packages are not shipped;
+consumers must convert boundary PCM to canonical F32 and use ABI major two.
 
 ## Build and verify
 
@@ -93,10 +76,9 @@ sudo make install PREFIX=/usr/local
 sudo ldconfig
 ```
 
-This installs both versioned shared objects, their unversioned development
-linker symlinks, public headers, and pkg-config metadata. ABI major two
-requires the matching sample-rate adapter runtime package; frozen ABI major one
-requires its matching ABI-major-two runtime package.
+This installs the versioned shared object, its unversioned development linker
+symlink, public header, and pkg-config metadata. The runtime requires the
+matching sample-rate adapter package.
 
 The public C ABI reference and generated Rust declaration reference are in
 `build/doxygen/html/index.html`; Rustdoc supplements them in `target/doc`.

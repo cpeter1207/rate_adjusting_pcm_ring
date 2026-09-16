@@ -7,23 +7,6 @@ Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/rate_adjusting_pcm_ring
 Rules-Requires-Root: no
 
-Package: librate-adjusting-pcm-ring1
-Architecture: amd64 arm64
-Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}, librate-adjusting-pcm-ring2 (= ${binary:Version})
-Description: ABI-compatible S16 facade for the Rust PCM ring
- Frozen ABI-major-1 shared library for existing USBRadioPlus and rpt_advanced
- consumers. Its C facade forwards to the Rust-owned rate recovery and bounded
- packet-loss-concealment implementation in ABI major two.
-
-Package: librate-adjusting-pcm-ring-dev
-Architecture: amd64 arm64
-Multi-Arch: same
-Depends: ${misc:Depends}, librate-adjusting-pcm-ring1 (= ${binary:Version}), librate-adjusting-pcm-ring2-dev (= ${binary:Version})
-Description: development files for the ABI-compatible S16 PCM facade
- ABI-major-1 public header and pkg-config metadata for existing dynamic
- consumers. No static archive is shipped.
-
 Package: librate-adjusting-pcm-ring2
 Architecture: amd64 arm64
 Multi-Arch: same

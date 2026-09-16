@@ -7,7 +7,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::samplerate_adapter::{AdapterFunctions, Converter};
 
@@ -164,8 +164,8 @@ pub(crate) struct Ring {
     filtered_occupancy_milli: AtomicU64,
     ratio_correction_ppm: AtomicI32,
     adapter_error_count: AtomicU64,
-    input_rate_hz: AtomicU32,
-    output_rate_hz: AtomicU32,
+    input_rate_hz: u32,
+    output_rate_hz: u32,
     consumer: UnsafeCell<ConsumerState>,
 }
 
@@ -184,64 +184,7 @@ impl Ring {
         quality: Quality,
         adapter: AdapterFunctions,
     ) -> Result<Self, CreateError> {
-        Self::create_with_minimum(
-            capacity,
-            input_rate_hz,
-            output_rate_hz,
-            quality,
-            adapter,
-            MINIMUM_CAPACITY,
-        )
-    }
-
-    /// Construct the frozen ABI-major-one facade with its historic small sizes.
-    ///
-    /// ABI major one permitted every nonzero capacity. New F32 callers use the
-    /// safer documented minimum through the canonical F32 constructor instead.
-    pub(crate) fn legacy_create(
-        capacity: usize,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-        quality: Quality,
-        adapter: AdapterFunctions,
-    ) -> Result<Self, CreateError> {
-        Self::create_with_minimum(capacity, input_rate_hz, output_rate_hz, quality, adapter, 1)
-    }
-
-    /// Reset converter-only state for a stopped ABI-major-one rate change.
-    ///
-    /// The released S16 interface retained unread source PCM and diagnostics
-    /// across `rpcr_set_rates()`. Its compatibility facade therefore resets
-    /// only persistent conversion and controller state instead of replacing
-    /// the Rust ring and discarding queued samples.
-    pub(crate) fn legacy_reconfigure(
-        &self,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-    ) -> Result<(), CreateError> {
-        if input_rate_hz == 0 || output_rate_hz == 0 {
-            return Err(CreateError::NoMemory);
-        }
-        // The ABI-major-one contract requires both endpoints to be stopped,
-        // so its compatibility bridge may reset the consumer-owned converter.
-        let state = unsafe { &mut *self.consumer.get() };
-        state.converter.reset().map_err(|()| CreateError::Adapter)?;
-        state.reset_after_rate_change();
-        self.input_rate_hz.store(input_rate_hz, Ordering::Relaxed);
-        self.output_rate_hz.store(output_rate_hz, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Allocate one immutable-rate ring using the selected ABI's capacity rule.
-    fn create_with_minimum(
-        capacity: usize,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-        quality: Quality,
-        adapter: AdapterFunctions,
-        minimum_capacity: usize,
-    ) -> Result<Self, CreateError> {
-        if capacity < minimum_capacity || input_rate_hz == 0 || output_rate_hz == 0 {
+        if capacity < MINIMUM_CAPACITY || input_rate_hz == 0 || output_rate_hz == 0 {
             return Err(CreateError::NoMemory);
         }
 
@@ -274,8 +217,8 @@ impl Ring {
             filtered_occupancy_milli: AtomicU64::new(0),
             ratio_correction_ppm: AtomicI32::new(0),
             adapter_error_count: AtomicU64::new(0),
-            input_rate_hz: AtomicU32::new(input_rate_hz),
-            output_rate_hz: AtomicU32::new(output_rate_hz),
+            input_rate_hz,
+            output_rate_hz,
             consumer: UnsafeCell::new(ConsumerState {
                 converter,
                 input,
@@ -349,61 +292,10 @@ impl Ring {
         Some(sample)
     }
 
-    /// Consume one unconverted source sample for the frozen ABI-major-one shim.
-    ///
-    /// ABI major two deliberately exposes rendering only, so every new user
-    /// receives rate recovery. The old public ABI included a raw-pop entry
-    /// point, however, and its small Rust compatibility bridge must retain
-    /// that published behavior until ABI-major-one consumers migrate.
-    pub(crate) fn legacy_consumer_pop_source_sample(&self) -> Option<f32> {
-        self.consumer_take_source_sample()
-    }
-
-    /// Publish the ABI-major-one reserve diagnostic before sample rendering.
-    ///
-    /// Reserve has never gated playout; it is retained for observability and
-    /// source compatibility with the signed-16 interface.
-    pub(crate) fn legacy_set_reserve(&self, reserve_samples: u64) {
-        self.reserve_samples
-            .store(reserve_samples, Ordering::Relaxed);
-    }
-
-    /// Produce one compatibility concealment sample without consuming source.
-    ///
-    /// The released ABI-major-one block renderer uses this only when a caller
-    /// requests more output samples than its fixed workspace can render. That
-    /// historical exceptional path advanced PLC state without reading source
-    /// PCM or accounting a normal renderer shortfall.
-    pub(crate) fn legacy_conceal_sample(&self) -> f32 {
-        let output_rate_hz = self.output_rate_hz.load(Ordering::Relaxed);
-        // The legacy contract assigns this operation to the sole consumer.
-        let state = unsafe { &mut *self.consumer.get() };
-        state.conceal_one(output_rate_hz, self.capacity)
-    }
-
-    /// Return the immutable consumer sample rate for a legacy statistics shim.
-    pub(crate) fn output_rate_hz(&self) -> u32 {
-        self.output_rate_hz.load(Ordering::Relaxed)
-    }
-
-    /// Return the ABI-major-one source cursor snapshots without exposing them
-    /// through the new opaque F32 interface.
-    pub(crate) fn legacy_cursor_positions(&self) -> (u64, u64) {
-        (
-            self.written.load(Ordering::Acquire),
-            self.read.load(Ordering::Acquire),
-        )
-    }
-
-    /// Return the private discarded counter for the ABI-major-one block shim.
-    pub(crate) fn legacy_discarded_counter(&self) -> &AtomicU64 {
-        &self.discarded
-    }
-
     /// Render one hardware-paced sample through persistent conversion.
     pub(crate) fn consumer_render_sample(&self, target_samples: u64) -> (f32, bool, bool) {
         self.target_samples.store(target_samples, Ordering::Relaxed);
-        let output_rate_hz = self.output_rate_hz.load(Ordering::Relaxed);
+        let output_rate_hz = self.output_rate_hz;
         // This mutable state is exclusively consumer-owned by the public SPSC
         // contract.  Producer calls cannot access it.
         let state = unsafe { &mut *self.consumer.get() };
@@ -492,7 +384,7 @@ impl Ring {
         } else {
             saturating_add_counter(&self.consecutive_shortfall, 1)
         };
-        let denominator = u64::from(self.output_rate_hz.load(Ordering::Relaxed)).saturating_mul(10);
+        let denominator = u64::from(self.output_rate_hz).saturating_mul(10);
         let weight = 1_u64;
         let average = self.shortfall_average_micro.load(Ordering::Relaxed);
         let measured = consecutive.saturating_mul(1_000_000);
@@ -546,8 +438,8 @@ impl ConsumerState {
         ring.filtered_occupancy_milli
             .store(self.occupancy_milli, Ordering::Relaxed);
 
-        let output_rate_hz = ring.output_rate_hz.load(Ordering::Relaxed);
-        let input_rate_hz = ring.input_rate_hz.load(Ordering::Relaxed);
+        let output_rate_hz = ring.output_rate_hz;
+        let input_rate_hz = ring.input_rate_hz;
         let nominal = f64::from(output_rate_hz) / f64::from(input_rate_hz);
         let error = if target_samples == 0 {
             0.0
@@ -606,20 +498,6 @@ impl ConsumerState {
         self.input
             .copy_within(self.input_offset..self.input_offset + self.input_pending, 0);
         self.input_offset = 0;
-    }
-
-    /// Clear only converter-derived state after a stopped legacy rate change.
-    fn reset_after_rate_change(&mut self) {
-        self.input_offset = 0;
-        self.input_pending = 0;
-        self.output_offset = 0;
-        self.output_pending = 0;
-        self.plc_period = 0;
-        self.plc_samples = 0;
-        self.recovery_samples = 0;
-        self.zero_progress = false;
-        self.occupancy_milli = 0;
-        self.ratio = 0.0;
     }
 
     /// Retain actual playout for bounded later pitch-period continuation.
