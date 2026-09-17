@@ -1,3 +1,9 @@
+rate-adjusting-pcm-ring (2.0.0~alpha2-1) unstable; urgency=medium
+
+  * Publish the complete ABI-major-2 descriptor required by current consumers.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Wed, 17 Sep 2026 12:00:00 -0500
+
 rate-adjusting-pcm-ring (2.0.0~alpha1-1) unstable; urgency=medium
 
   * Publish the Rust-owned canonical-F32 ABI-major-2 shared object.

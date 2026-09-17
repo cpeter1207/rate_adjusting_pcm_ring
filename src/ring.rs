@@ -717,10 +717,11 @@ pub(crate) fn attenuate_concealment(sample: f32, position: usize, output_rate_hz
     if fade == 0 || position <= hold {
         return sample;
     }
-    if position >= fade {
+    let end = hold.saturating_add(fade);
+    if position >= end {
         return 0.0;
     }
-    sample * (fade - position) as f32 / (fade - hold) as f32
+    sample * (end - position) as f32 / fade as f32
 }
 
 /// Blend waveform segments with equal-power f64 control math.

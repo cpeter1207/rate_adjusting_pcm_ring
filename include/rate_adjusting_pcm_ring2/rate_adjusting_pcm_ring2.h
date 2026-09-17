@@ -203,14 +203,16 @@ struct rpcr2_descriptor {
    * @param output Destination for @p samples canonical F32 outputs, or null
    * only for zero.
    * @param samples Arbitrary requested output-sample count.
-   * @param reserve_samples Minimum source occupancy before playout begins or resumes.
+   * @param reserve_samples Minimum source occupancy before playout begins or
+   * resumes.
    * @param target_samples Input occupancy target for slow ratio correction.
    * @param real_samples Destination for the count derived from source PCM.
    * @return One @ref rpcr2_result value.
    *
    * Playout begins only after @p reserve_samples are buffered. Target gently
-   * adjusts persistent conversion ratio. Any zero-occupancy shortfall is
-   * concealed for up to 20 ms before the consumer reprimes.
+   * adjusts persistent conversion ratio. A zero-occupancy shortfall holds and
+   * fades history over 20 ms, then resumes through recovery crossfade when
+   * source PCM returns.
    */
   enum rpcr2_result (*ring_consumer_render)(struct rpcr2_ring *ring,
                                             float *output, uint64_t samples,

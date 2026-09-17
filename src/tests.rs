@@ -405,10 +405,14 @@ fn full_producer_rejects_only_new_samples() {
 }
 
 #[test]
-fn rendering_does_not_gate_startup_on_reserve() {
+fn rendering_primes_startup_to_reserve() {
     let ring = ring(512);
     assert_eq!(ring.producer_push(&[0.1, 0.2, 0.3, 0.4]), 4);
     let mut output = [0.0; 4];
+    assert_eq!(ring.consumer_render(&mut output, 12, 8).0, 0);
+    assert_eq!(output, [0.0; 4]);
+
+    assert_eq!(ring.producer_push(&[0.5; 8]), 8);
     assert_eq!(ring.consumer_render(&mut output, 12, 8).0, 4);
     assert_eq!(output, [0.1, 0.2, 0.3, 0.4]);
     let observation = ring.observe();
@@ -627,8 +631,8 @@ fn concealment_fades_and_recovers_at_its_sample_boundaries() {
     }
     assert_ne!(concealed[0], 0.0);
     assert_ne!(concealed[80], 0.0);
-    assert_ne!(concealed[479], 0.0);
-    assert_eq!(concealed[480], 0.0);
+    assert_ne!(concealed[159], 0.0);
+    assert_eq!(concealed[160], 0.0);
 
     assert_eq!(ring.producer_push(&vec![0.4; 512]), 512);
     for _ in 0..64 {
@@ -872,6 +876,7 @@ fn public_descriptor_exposes_the_complete_abi_v2_function_table() {
     assert!(descriptor.ring_producer_push as usize != 0);
     assert!(descriptor.ring_consumer_render_sample as usize != 0);
     assert!(descriptor.ring_consumer_render as usize != 0);
+    assert!(descriptor.ring_consumer_reset as usize != 0);
     assert!(descriptor.ring_observe as usize != 0);
 }
 
