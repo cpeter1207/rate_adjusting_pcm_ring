@@ -107,7 +107,7 @@ struct rpcr2_observation {
   uint64_t capacity_samples;
   /** Input samples currently available to the consumer. */
   uint64_t available_samples;
-  /** Latest caller-selected protected reserve, for diagnostics only. */
+  /** Latest caller-selected playout priming reserve. */
   uint64_t reserve_samples;
   /** Low-pass filtered input occupancy used by the rate controller. */
   uint64_t filtered_occupancy_samples;
@@ -203,20 +203,32 @@ struct rpcr2_descriptor {
    * @param output Destination for @p samples canonical F32 outputs, or null
    * only for zero.
    * @param samples Arbitrary requested output-sample count.
-   * @param reserve_samples Protected reserve published for diagnostics only.
+   * @param reserve_samples Minimum source occupancy before playout begins or
+   * resumes.
    * @param target_samples Input occupancy target for slow ratio correction.
    * @param real_samples Destination for the count derived from source PCM.
    * @return One @ref rpcr2_result value.
    *
-   * Reserve and target never gate initial playout; target only gently adjusts
-   * persistent conversion ratio.  Any source shortfall is concealed and
-   * internally accounted exactly once by this rendering API.
+   * Playout begins only after @p reserve_samples are buffered. Target gently
+   * adjusts persistent conversion ratio. A zero-occupancy shortfall holds and
+   * fades history over 20 ms, then resumes through recovery crossfade when
+   * source PCM returns.
    */
   enum rpcr2_result (*ring_consumer_render)(struct rpcr2_ring *ring,
                                             float *output, uint64_t samples,
                                             uint64_t reserve_samples,
                                             uint64_t target_samples,
                                             uint64_t *real_samples);
+  /**
+   * @brief End the current burst and require reserve priming before resuming.
+   * @param ring Ring with exactly one active consumer.
+   * @return One @ref rpcr2_result value.
+   *
+   * Pending PCM and concealment history are discarded even when reset fails.
+   * On failure, rendering produces silence and reports @ref RPCR2_ADAPTER_ERROR
+   * until a later reset succeeds. Serialize reset with every rendering call.
+   */
+  enum rpcr2_result (*ring_consumer_reset)(struct rpcr2_ring *ring);
   /**
    * @brief Copy a best-effort observation without stopping either endpoint.
    * @param ring Ring to observe.

@@ -1,13 +1,13 @@
 //! Lock-free SPSC PCM storage, rate recovery, and bounded concealment.
 //!
-//! The producer and consumer share only monotonic atomic cursors and
+//! The producer and consumer share only bounded atomic cursors and
 //! observable counters.  Conversion, occupancy control, and concealment are
 //! owned exclusively by the consumer, so neither audio operation allocates,
 //! locks, logs, or performs I/O after construction.
 
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use crate::samplerate_adapter::{AdapterFunctions, Converter};
 
@@ -21,8 +21,8 @@ const PLC_ANALYSIS_MS: u32 = 5;
 const PLC_CROSSFADE_MS: u32 = 8;
 /// Full-level continuation period before a sustained loss begins fading.
 const PLC_HOLD_MS: u32 = 10;
-/// Maximum continuation duration before silence replaces repeated history.
-const PLC_FADE_MS: u32 = 60;
+/// Crossfade duration after the initial continuation before silence.
+const PLC_FADE_MS: u32 = 10;
 /// Maximum input/output chunk handed to the persistent converter per refill.
 const CONVERTER_QUANTUM: usize = 256;
 /// Smallest workspace that can grow once after a zero-progress SRC call.
@@ -73,7 +73,7 @@ pub(crate) struct Observation {
     pub(crate) capacity_samples: u64,
     /// Source samples currently readable by the consumer.
     pub(crate) available_samples: u64,
-    /// Latest requested retained floor, for diagnostics only.
+    /// Latest caller-selected playout priming floor.
     pub(crate) reserve_samples: u64,
     /// Low-pass filtered source occupancy.
     pub(crate) filtered_occupancy_samples: u64,
@@ -131,6 +131,9 @@ struct ConsumerState {
     zero_progress: bool,
     occupancy_milli: u64,
     ratio: f64,
+    primed: bool,
+    /// A failed adapter reset blocks conversion until a later reset succeeds.
+    reset_failed: bool,
 }
 
 /// All preallocated payload and consumer workspaces owned by one ring.
@@ -148,6 +151,9 @@ struct Workspaces {
 /// its release-store advances `written`, while one consumer reads that slot
 /// only after acquiring `written`.  The SPSC contract is part of the public
 /// ABI.  Every other shared field is an atomic diagnostic or cursor.
+/// Cursors wrap at twice capacity so their distance distinguishes full from
+/// empty and their storage indices stay aligned across every wrap. Release
+/// publication and acquire consumption preserve the SPSC payload ordering.
 pub(crate) struct Ring {
     storage: Box<[UnsafeCell<f32>]>,
     capacity: usize,
@@ -164,8 +170,8 @@ pub(crate) struct Ring {
     filtered_occupancy_milli: AtomicU64,
     ratio_correction_ppm: AtomicI32,
     adapter_error_count: AtomicU64,
-    input_rate_hz: AtomicU32,
-    output_rate_hz: AtomicU32,
+    input_rate_hz: u32,
+    output_rate_hz: u32,
     consumer: UnsafeCell<ConsumerState>,
 }
 
@@ -184,64 +190,10 @@ impl Ring {
         quality: Quality,
         adapter: AdapterFunctions,
     ) -> Result<Self, CreateError> {
-        Self::create_with_minimum(
-            capacity,
-            input_rate_hz,
-            output_rate_hz,
-            quality,
-            adapter,
-            MINIMUM_CAPACITY,
-        )
-    }
-
-    /// Construct the frozen ABI-major-one facade with its historic small sizes.
-    ///
-    /// ABI major one permitted every nonzero capacity. New F32 callers use the
-    /// safer documented minimum through the canonical F32 constructor instead.
-    pub(crate) fn legacy_create(
-        capacity: usize,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-        quality: Quality,
-        adapter: AdapterFunctions,
-    ) -> Result<Self, CreateError> {
-        Self::create_with_minimum(capacity, input_rate_hz, output_rate_hz, quality, adapter, 1)
-    }
-
-    /// Reset converter-only state for a stopped ABI-major-one rate change.
-    ///
-    /// The released S16 interface retained unread source PCM and diagnostics
-    /// across `rpcr_set_rates()`. Its compatibility facade therefore resets
-    /// only persistent conversion and controller state instead of replacing
-    /// the Rust ring and discarding queued samples.
-    pub(crate) fn legacy_reconfigure(
-        &self,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-    ) -> Result<(), CreateError> {
-        if input_rate_hz == 0 || output_rate_hz == 0 {
-            return Err(CreateError::NoMemory);
-        }
-        // The ABI-major-one contract requires both endpoints to be stopped,
-        // so its compatibility bridge may reset the consumer-owned converter.
-        let state = unsafe { &mut *self.consumer.get() };
-        state.converter.reset().map_err(|()| CreateError::Adapter)?;
-        state.reset_after_rate_change();
-        self.input_rate_hz.store(input_rate_hz, Ordering::Relaxed);
-        self.output_rate_hz.store(output_rate_hz, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Allocate one immutable-rate ring using the selected ABI's capacity rule.
-    fn create_with_minimum(
-        capacity: usize,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-        quality: Quality,
-        adapter: AdapterFunctions,
-        minimum_capacity: usize,
-    ) -> Result<Self, CreateError> {
-        if capacity < minimum_capacity || input_rate_hz == 0 || output_rate_hz == 0 {
+        if !(MINIMUM_CAPACITY..=MAXIMUM_CAPACITY).contains(&capacity)
+            || input_rate_hz == 0
+            || output_rate_hz == 0
+        {
             return Err(CreateError::NoMemory);
         }
 
@@ -274,8 +226,8 @@ impl Ring {
             filtered_occupancy_milli: AtomicU64::new(0),
             ratio_correction_ppm: AtomicI32::new(0),
             adapter_error_count: AtomicU64::new(0),
-            input_rate_hz: AtomicU32::new(input_rate_hz),
-            output_rate_hz: AtomicU32::new(output_rate_hz),
+            input_rate_hz,
+            output_rate_hz,
             consumer: UnsafeCell::new(ConsumerState {
                 converter,
                 input,
@@ -294,6 +246,8 @@ impl Ring {
                 zero_progress: false,
                 occupancy_milli: 0,
                 ratio: 0.0,
+                primed: false,
+                reset_failed: false,
             }),
         })
     }
@@ -302,7 +256,7 @@ impl Ring {
     pub(crate) fn producer_push_sample(&self, sample: f32) -> bool {
         let written = self.written.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
-        if written.wrapping_sub(read) >= self.capacity_u64 {
+        if self.cursor_distance(written, read) >= self.capacity_u64 {
             saturating_add_counter(&self.discarded, 1);
             return false;
         }
@@ -313,7 +267,7 @@ impl Ring {
             *self.storage[index].get() = canonicalize(sample);
         }
         self.written
-            .store(written.wrapping_add(1), Ordering::Release);
+            .store((written + 1) % (self.capacity_u64 * 2), Ordering::Release);
         true
     }
 
@@ -345,65 +299,15 @@ impl Ring {
         // The producer's release publication above makes this slot readable;
         // the consumer alone advances `read`, so no second consumer can race.
         let sample = unsafe { *self.storage[index].get() };
-        self.read.store(read.wrapping_add(1), Ordering::Release);
+        self.read
+            .store((read + 1) % (self.capacity_u64 * 2), Ordering::Release);
         Some(sample)
-    }
-
-    /// Consume one unconverted source sample for the frozen ABI-major-one shim.
-    ///
-    /// ABI major two deliberately exposes rendering only, so every new user
-    /// receives rate recovery. The old public ABI included a raw-pop entry
-    /// point, however, and its small Rust compatibility bridge must retain
-    /// that published behavior until ABI-major-one consumers migrate.
-    pub(crate) fn legacy_consumer_pop_source_sample(&self) -> Option<f32> {
-        self.consumer_take_source_sample()
-    }
-
-    /// Publish the ABI-major-one reserve diagnostic before sample rendering.
-    ///
-    /// Reserve has never gated playout; it is retained for observability and
-    /// source compatibility with the signed-16 interface.
-    pub(crate) fn legacy_set_reserve(&self, reserve_samples: u64) {
-        self.reserve_samples
-            .store(reserve_samples, Ordering::Relaxed);
-    }
-
-    /// Produce one compatibility concealment sample without consuming source.
-    ///
-    /// The released ABI-major-one block renderer uses this only when a caller
-    /// requests more output samples than its fixed workspace can render. That
-    /// historical exceptional path advanced PLC state without reading source
-    /// PCM or accounting a normal renderer shortfall.
-    pub(crate) fn legacy_conceal_sample(&self) -> f32 {
-        let output_rate_hz = self.output_rate_hz.load(Ordering::Relaxed);
-        // The legacy contract assigns this operation to the sole consumer.
-        let state = unsafe { &mut *self.consumer.get() };
-        state.conceal_one(output_rate_hz, self.capacity)
-    }
-
-    /// Return the immutable consumer sample rate for a legacy statistics shim.
-    pub(crate) fn output_rate_hz(&self) -> u32 {
-        self.output_rate_hz.load(Ordering::Relaxed)
-    }
-
-    /// Return the ABI-major-one source cursor snapshots without exposing them
-    /// through the new opaque F32 interface.
-    pub(crate) fn legacy_cursor_positions(&self) -> (u64, u64) {
-        (
-            self.written.load(Ordering::Acquire),
-            self.read.load(Ordering::Acquire),
-        )
-    }
-
-    /// Return the private discarded counter for the ABI-major-one block shim.
-    pub(crate) fn legacy_discarded_counter(&self) -> &AtomicU64 {
-        &self.discarded
     }
 
     /// Render one hardware-paced sample through persistent conversion.
     pub(crate) fn consumer_render_sample(&self, target_samples: u64) -> (f32, bool, bool) {
         self.target_samples.store(target_samples, Ordering::Relaxed);
-        let output_rate_hz = self.output_rate_hz.load(Ordering::Relaxed);
+        let output_rate_hz = self.output_rate_hz;
         // This mutable state is exclusively consumer-owned by the public SPSC
         // contract.  Producer calls cannot access it.
         let state = unsafe { &mut *self.consumer.get() };
@@ -442,6 +346,17 @@ impl Ring {
         let mut real_samples = 0_u64;
         let mut adapter_error = false;
         for sample in output {
+            // A new burst is intentionally held until it has enough lookback
+            // for squelch and DTMF decisions. This is silence, not PLC: no
+            // source PCM has been lost yet.
+            let primed = unsafe { &mut *self.consumer.get() };
+            if !primed.primed && !primed.reset_failed {
+                if self.available() < reserve_samples {
+                    *sample = 0.0;
+                    continue;
+                }
+                primed.primed = true;
+            }
             let (rendered, real, errored) = self.consumer_render_sample(target_samples);
             *sample = rendered;
             if real {
@@ -452,11 +367,27 @@ impl Ring {
         (real_samples, adapter_error)
     }
 
+    /// End the current burst and discard unread/converted pre-edge PCM.
+    /// A failed adapter reset leaves rendering silent until a reset succeeds.
+    pub(crate) fn consumer_reset(&self) -> Result<(), ()> {
+        let written = self.written.load(Ordering::Acquire);
+        self.read.store(written, Ordering::Release);
+        let state = unsafe { &mut *self.consumer.get() };
+        state.reset()
+    }
+
     /// Return readable producer samples, bounded to the configured capacity.
     pub(crate) fn available(&self) -> u64 {
         let written = self.written.load(Ordering::Acquire);
         let read = self.read.load(Ordering::Acquire);
-        written.wrapping_sub(read).min(self.capacity_u64)
+        self.cursor_distance(written, read).min(self.capacity_u64)
+    }
+
+    /// Return forward distance in the capacity-aligned two-lap cursor domain.
+    /// The u32 capacity limit keeps this u64 sum and subtraction in range.
+    fn cursor_distance(&self, written: u64, read: u64) -> u64 {
+        let modulus = self.capacity_u64 * 2;
+        (written + modulus - read) % modulus
     }
 
     /// Capture an individually current, lock-free diagnostic snapshot.
@@ -492,7 +423,7 @@ impl Ring {
         } else {
             saturating_add_counter(&self.consecutive_shortfall, 1)
         };
-        let denominator = u64::from(self.output_rate_hz.load(Ordering::Relaxed)).saturating_mul(10);
+        let denominator = u64::from(self.output_rate_hz).saturating_mul(10);
         let weight = 1_u64;
         let average = self.shortfall_average_micro.load(Ordering::Relaxed);
         let measured = consecutive.saturating_mul(1_000_000);
@@ -505,8 +436,32 @@ impl Ring {
 }
 
 impl ConsumerState {
+    /// Discard every ended-burst cache even if the adapter cannot reset.
+    /// Conversion stays blocked after failure until a later reset succeeds.
+    fn reset(&mut self) -> Result<(), ()> {
+        let result = self.converter.reset();
+        self.reset_failed = result.is_err();
+        self.input_offset = 0;
+        self.input_pending = 0;
+        self.output_offset = 0;
+        self.output_pending = 0;
+        self.history_length = 0;
+        self.history_next = 0;
+        self.plc_period = 0;
+        self.plc_samples = 0;
+        self.recovery_samples = 0;
+        self.zero_progress = false;
+        self.occupancy_milli = 0;
+        self.ratio = 0.0;
+        self.primed = false;
+        result
+    }
+
     /// Refill the converted cache with one bounded persistent SRC operation.
     fn refill_output(&mut self, ring: &Ring, target_samples: u64) -> RefillResult {
+        if self.reset_failed {
+            return RefillResult::AdapterError;
+        }
         if self.output_pending != 0 {
             return RefillResult::Ready;
         }
@@ -546,8 +501,8 @@ impl ConsumerState {
         ring.filtered_occupancy_milli
             .store(self.occupancy_milli, Ordering::Relaxed);
 
-        let output_rate_hz = ring.output_rate_hz.load(Ordering::Relaxed);
-        let input_rate_hz = ring.input_rate_hz.load(Ordering::Relaxed);
+        let output_rate_hz = ring.output_rate_hz;
+        let input_rate_hz = ring.input_rate_hz;
         let nominal = f64::from(output_rate_hz) / f64::from(input_rate_hz);
         let error = if target_samples == 0 {
             0.0
@@ -606,20 +561,6 @@ impl ConsumerState {
         self.input
             .copy_within(self.input_offset..self.input_offset + self.input_pending, 0);
         self.input_offset = 0;
-    }
-
-    /// Clear only converter-derived state after a stopped legacy rate change.
-    fn reset_after_rate_change(&mut self) {
-        self.input_offset = 0;
-        self.input_pending = 0;
-        self.output_offset = 0;
-        self.output_pending = 0;
-        self.plc_period = 0;
-        self.plc_samples = 0;
-        self.recovery_samples = 0;
-        self.zero_progress = false;
-        self.occupancy_milli = 0;
-        self.ratio = 0.0;
     }
 
     /// Retain actual playout for bounded later pitch-period continuation.
@@ -798,10 +739,11 @@ pub(crate) fn attenuate_concealment(sample: f32, position: usize, output_rate_hz
     if fade == 0 || position <= hold {
         return sample;
     }
-    if position >= fade {
+    let end = hold.saturating_add(fade);
+    if position >= end {
         return 0.0;
     }
-    sample * (fade - position) as f32 / (fade - hold) as f32
+    sample * (end - position) as f32 / fade as f32
 }
 
 /// Blend waveform segments with equal-power f64 control math.
@@ -811,3 +753,7 @@ fn equal_power_mix(outgoing: f32, incoming: f32, index: usize, samples: usize) -
         (1.0 - progress).sqrt() * f64::from(outgoing) + progress.sqrt() * f64::from(incoming);
     canonicalize(mixed as f32)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/ring_state.rs"]
+mod state_tests;

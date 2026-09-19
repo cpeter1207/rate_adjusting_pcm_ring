@@ -8,9 +8,8 @@ make lint static-analysis
 
 The Debian 13 pull-request gate runs formatting, lint, static analysis, and
 Doxygen once, then runs native amd64 and arm64 build, test, packaging, staged
-install, and archive checks. Production Rust code and the frozen ABI-major-1
-C compatibility source must each have 100% line and branch coverage on Debian
-13 amd64; test code is excluded.
+install, and archive checks. Production Rust code must have 100% line and
+branch coverage on Debian 13 amd64; test code is excluded.
 
 The ring's quality container is a disposable, labeled container. Its launcher
 first removes only stopped stale containers with the exact project and workspace

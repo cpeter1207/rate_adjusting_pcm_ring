@@ -39,6 +39,7 @@ int main(void) {
   assert(descriptor->ring_producer_push != NULL);
   assert(descriptor->ring_consumer_render_sample != NULL);
   assert(descriptor->ring_consumer_render != NULL);
+  assert(descriptor->ring_consumer_reset != NULL);
   assert(descriptor->ring_observe != NULL);
   assert(descriptor->ring_create(&config, &ring) == RPCR2_OK);
   assert(ring != NULL);

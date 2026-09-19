@@ -4,6 +4,7 @@ on:
     tags: ['v*']
 permissions:
   checks: read
+  pull-requests: read
   contents: write
   pages: write
   id-token: write
@@ -13,3 +14,4 @@ jobs:
     with:
       code_ref: ${{ github.sha }}
       tag: ${{ github.ref_name }}
+      samplerate_adapter_tag: v0.1.0-alpha.2
