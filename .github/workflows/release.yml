@@ -4,6 +4,7 @@ on:
     tags: ['v*']
 permissions:
   checks: read
+  pull-requests: read
   contents: write
   pages: write
   id-token: write

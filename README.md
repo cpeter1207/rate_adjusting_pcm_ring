@@ -6,11 +6,13 @@ Rust dynamic shared object with an opaque C handle and canonical mono F32 PCM
 in the normalized range `-1.0` through `+1.0`.
 
 The producer never waits or overwrites unread PCM. The consumer owns one
-persistent dynamic sample-rate adapter, uses source PCM as soon as it is
-available, and applies a slow occupancy-driven ratio correction for clock
-drift. Reserve and target values are diagnostic and controller inputs, not
-startup gates. Brief output shortfalls use bounded pitch-period continuation
+persistent dynamic sample-rate adapter. Block rendering waits for the requested
+reserve before new-burst playout. The occupancy target controls slow clock-drift
+correction. Brief output shortfalls use bounded pitch-period continuation
 with equal-power entry and recovery transitions; sustained loss fades out.
+
+Reset discards pending PCM and concealment history even if the adapter reset
+fails. Rendering stays silent after a failed reset until a later reset succeeds.
 
 The library dynamically links `librptadv_samplerate_adapter.so.1`, the
 separately versioned project adapter. It does not ship a static archive.

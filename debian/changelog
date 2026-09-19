@@ -1,3 +1,10 @@
+rate-adjusting-pcm-ring (2.0.0~alpha3-1) unstable; urgency=medium
+
+  * Preserve FIFO ordering across cursor wraps and silence failed resets.
+  * Release the complete ABI-major-2 descriptor and remove obsolete ABI 1.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Sat, 19 Sep 2026 09:00:00 -0500
+
 rate-adjusting-pcm-ring (2.0.0~alpha2-1) unstable; urgency=medium
 
   * Publish the complete ABI-major-2 descriptor required by current consumers.
