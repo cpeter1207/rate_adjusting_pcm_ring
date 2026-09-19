@@ -223,6 +223,10 @@ struct rpcr2_descriptor {
    * @brief End the current burst and require reserve priming before resuming.
    * @param ring Ring with exactly one active consumer.
    * @return One @ref rpcr2_result value.
+   *
+   * Pending PCM and concealment history are discarded even when reset fails.
+   * On failure, rendering produces silence and reports @ref RPCR2_ADAPTER_ERROR
+   * until a later reset succeeds. Serialize reset with every rendering call.
    */
   enum rpcr2_result (*ring_consumer_reset)(struct rpcr2_ring *ring);
   /**

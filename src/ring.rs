@@ -1,6 +1,6 @@
 //! Lock-free SPSC PCM storage, rate recovery, and bounded concealment.
 //!
-//! The producer and consumer share only monotonic atomic cursors and
+//! The producer and consumer share only bounded atomic cursors and
 //! observable counters.  Conversion, occupancy control, and concealment are
 //! owned exclusively by the consumer, so neither audio operation allocates,
 //! locks, logs, or performs I/O after construction.
@@ -132,6 +132,8 @@ struct ConsumerState {
     occupancy_milli: u64,
     ratio: f64,
     primed: bool,
+    /// A failed adapter reset blocks conversion until a later reset succeeds.
+    reset_failed: bool,
 }
 
 /// All preallocated payload and consumer workspaces owned by one ring.
@@ -149,6 +151,9 @@ struct Workspaces {
 /// its release-store advances `written`, while one consumer reads that slot
 /// only after acquiring `written`.  The SPSC contract is part of the public
 /// ABI.  Every other shared field is an atomic diagnostic or cursor.
+/// Cursors wrap at twice capacity so their distance distinguishes full from
+/// empty and their storage indices stay aligned across every wrap. Release
+/// publication and acquire consumption preserve the SPSC payload ordering.
 pub(crate) struct Ring {
     storage: Box<[UnsafeCell<f32>]>,
     capacity: usize,
@@ -185,7 +190,10 @@ impl Ring {
         quality: Quality,
         adapter: AdapterFunctions,
     ) -> Result<Self, CreateError> {
-        if capacity < MINIMUM_CAPACITY || input_rate_hz == 0 || output_rate_hz == 0 {
+        if !(MINIMUM_CAPACITY..=MAXIMUM_CAPACITY).contains(&capacity)
+            || input_rate_hz == 0
+            || output_rate_hz == 0
+        {
             return Err(CreateError::NoMemory);
         }
 
@@ -239,6 +247,7 @@ impl Ring {
                 occupancy_milli: 0,
                 ratio: 0.0,
                 primed: false,
+                reset_failed: false,
             }),
         })
     }
@@ -247,7 +256,7 @@ impl Ring {
     pub(crate) fn producer_push_sample(&self, sample: f32) -> bool {
         let written = self.written.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
-        if written.wrapping_sub(read) >= self.capacity_u64 {
+        if self.cursor_distance(written, read) >= self.capacity_u64 {
             saturating_add_counter(&self.discarded, 1);
             return false;
         }
@@ -258,7 +267,7 @@ impl Ring {
             *self.storage[index].get() = canonicalize(sample);
         }
         self.written
-            .store(written.wrapping_add(1), Ordering::Release);
+            .store((written + 1) % (self.capacity_u64 * 2), Ordering::Release);
         true
     }
 
@@ -290,7 +299,8 @@ impl Ring {
         // The producer's release publication above makes this slot readable;
         // the consumer alone advances `read`, so no second consumer can race.
         let sample = unsafe { *self.storage[index].get() };
-        self.read.store(read.wrapping_add(1), Ordering::Release);
+        self.read
+            .store((read + 1) % (self.capacity_u64 * 2), Ordering::Release);
         Some(sample)
     }
 
@@ -340,7 +350,7 @@ impl Ring {
             // for squelch and DTMF decisions. This is silence, not PLC: no
             // source PCM has been lost yet.
             let primed = unsafe { &mut *self.consumer.get() };
-            if !primed.primed {
+            if !primed.primed && !primed.reset_failed {
                 if self.available() < reserve_samples {
                     *sample = 0.0;
                     continue;
@@ -358,20 +368,26 @@ impl Ring {
     }
 
     /// End the current burst and discard unread/converted pre-edge PCM.
+    /// A failed adapter reset leaves rendering silent until a reset succeeds.
     pub(crate) fn consumer_reset(&self) -> Result<(), ()> {
         let written = self.written.load(Ordering::Acquire);
         self.read.store(written, Ordering::Release);
         let state = unsafe { &mut *self.consumer.get() };
-        state.reset()?;
-        state.primed = false;
-        Ok(())
+        state.reset()
     }
 
     /// Return readable producer samples, bounded to the configured capacity.
     pub(crate) fn available(&self) -> u64 {
         let written = self.written.load(Ordering::Acquire);
         let read = self.read.load(Ordering::Acquire);
-        written.wrapping_sub(read).min(self.capacity_u64)
+        self.cursor_distance(written, read).min(self.capacity_u64)
+    }
+
+    /// Return forward distance in the capacity-aligned two-lap cursor domain.
+    /// The u32 capacity limit keeps this u64 sum and subtraction in range.
+    fn cursor_distance(&self, written: u64, read: u64) -> u64 {
+        let modulus = self.capacity_u64 * 2;
+        (written + modulus - read) % modulus
     }
 
     /// Capture an individually current, lock-free diagnostic snapshot.
@@ -420,9 +436,11 @@ impl Ring {
 }
 
 impl ConsumerState {
-    /// Discard an ended burst before the next reserve-prime interval.
+    /// Discard every ended-burst cache even if the adapter cannot reset.
+    /// Conversion stays blocked after failure until a later reset succeeds.
     fn reset(&mut self) -> Result<(), ()> {
-        self.converter.reset()?;
+        let result = self.converter.reset();
+        self.reset_failed = result.is_err();
         self.input_offset = 0;
         self.input_pending = 0;
         self.output_offset = 0;
@@ -435,11 +453,15 @@ impl ConsumerState {
         self.zero_progress = false;
         self.occupancy_milli = 0;
         self.ratio = 0.0;
-        Ok(())
+        self.primed = false;
+        result
     }
 
     /// Refill the converted cache with one bounded persistent SRC operation.
     fn refill_output(&mut self, ring: &Ring, target_samples: u64) -> RefillResult {
+        if self.reset_failed {
+            return RefillResult::AdapterError;
+        }
         if self.output_pending != 0 {
             return RefillResult::Ready;
         }
@@ -731,3 +753,7 @@ fn equal_power_mix(outgoing: f32, incoming: f32, index: usize, samples: usize) -
         (1.0 - progress).sqrt() * f64::from(outgoing) + progress.sqrt() * f64::from(incoming);
     canonicalize(mixed as f32)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/ring_state.rs"]
+mod state_tests;

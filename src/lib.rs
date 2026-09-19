@@ -361,7 +361,7 @@ extern "C" fn ring_consumer_render(
     RESULT_OK
 }
 
-/// Discard a completed burst from the consumer-owned conversion state.
+/// Discard a completed burst, keeping rendering silent after a reset failure.
 extern "C" fn ring_consumer_reset(ring: *mut Rpcr2Ring) -> c_int {
     let ring = match unsafe { checked_ring(ring) } {
         Ok(ring) => ring,
