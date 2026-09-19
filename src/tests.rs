@@ -3,7 +3,8 @@
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::mem::size_of;
 use core::ptr;
-use std::alloc::Layout;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 
 use crate::ring::{
     CreateError, MAXIMUM_CAPACITY, Quality, Ring, allocate_samples, attenuate_concealment,
@@ -19,6 +20,62 @@ const OK: c_int = 0;
 const ERROR: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.samplerate\0";
 const WRONG_CAPABILITY_NAME: &[u8] = b"test.samplerate-adapter\0";
+
+thread_local! { static FAIL_BYTES: Cell<usize> = const { Cell::new(0) }; }
+struct Allocator;
+
+fn reject(bytes: usize) -> bool {
+    FAIL_BYTES
+        .try_with(|slot| {
+            if slot.get() == bytes {
+                slot.set(0);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+// SAFETY: layouts and live pointers are forwarded unchanged to System. Returning null
+// for one selected allocation is explicitly permitted by GlobalAlloc.
+unsafe impl GlobalAlloc for Allocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if reject(layout.size()) {
+            ptr::null_mut()
+        } else {
+            unsafe { System.alloc(layout) }
+        }
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+    }
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, bytes: usize) -> *mut u8 {
+        if reject(bytes) {
+            ptr::null_mut()
+        } else {
+            unsafe { System.realloc(pointer, layout, bytes) }
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Allocator = Allocator;
+
+fn fail_allocation<T>(bytes: usize, operation: impl FnOnce() -> T) -> T {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            FAIL_BYTES.set(0);
+        }
+    }
+    assert_ne!(bytes, 0);
+    assert_eq!(FAIL_BYTES.replace(bytes), 0);
+    let _clear = Clear;
+    let result = operation();
+    assert_eq!(FAIL_BYTES.get(), 0, "selected allocation was not reached");
+    result
+}
 
 struct FakeConverter;
 
@@ -479,6 +536,11 @@ fn construction_handles_control_plane_allocation_failure_without_panicking() {
     );
     assert!(matches!(too_large, Err(CreateError::NoMemory)));
     assert!(allocate_samples(usize::MAX).is_err());
+
+    let no_memory = fail_allocation(512 * size_of::<f32>(), || {
+        Ring::create(512, 8_000, 8_000, Quality::Best, adapter(&FAKE_DESCRIPTOR))
+    });
+    assert!(matches!(no_memory, Err(CreateError::NoMemory)));
 
     let ring = ring(512);
     assert!(crate::allocate_ring_handle_with(ring, null_allocator).is_err());
@@ -1007,6 +1069,36 @@ fn ring_create_classifies_invalid_configurations_and_adapter_failures() {
         ring_create_with_adapter(&config, &mut output, Ok(adapter(&RESET_FAILURE_DESCRIPTOR))),
         RESULT_ADAPTER_ERROR
     );
+}
+
+#[test]
+fn descriptor_reset_validates_handles_and_reports_adapter_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn reset(_converter: *mut c_void) -> c_int {
+        if FAIL.swap(false, Ordering::Relaxed) {
+            -1
+        } else {
+            0
+        }
+    }
+    let descriptor = descriptor();
+    let handle = handle_with(adapter(&AdapterDescriptor {
+        converter_reset: Some(reset),
+        ..FAKE_DESCRIPTOR
+    }));
+    assert_eq!(
+        (descriptor.ring_consumer_reset)(ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!((descriptor.ring_consumer_reset)(handle.as_ptr()), RESULT_OK);
+    FAIL.store(true, Ordering::Relaxed);
+    assert_eq!(
+        (descriptor.ring_consumer_reset)(handle.as_ptr()),
+        RESULT_ADAPTER_ERROR
+    );
+    assert_eq!((descriptor.ring_consumer_reset)(handle.as_ptr()), RESULT_OK);
 }
 
 #[test]
