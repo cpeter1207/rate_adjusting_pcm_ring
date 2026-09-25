@@ -731,3 +731,28 @@ fn equal_power_mix(outgoing: f32, incoming: f32, index: usize, samples: usize) -
         (1.0 - progress).sqrt() * f64::from(outgoing) + progress.sqrt() * f64::from(incoming);
     canonicalize(mixed as f32)
 }
+
+#[cfg(test)]
+mod legacy_counter_reproducer {
+    use super::*;
+
+    #[test]
+    fn u64_wrap_overwrites_unread_pcm_at_capacity_513() {
+        let adapter =
+            unsafe { AdapterFunctions::from_descriptor(&crate::tests::FAKE_DESCRIPTOR) }.unwrap();
+        let ring = Ring::create(513, 8_000, 8_000, Quality::Best, adapter).unwrap();
+        let start = u64::MAX - 511;
+        ring.written.store(start, Ordering::Relaxed);
+        ring.read.store(start, Ordering::Relaxed);
+        let input: Vec<f32> = (0..513).map(|index| index as f32 / 513.0).collect();
+        assert_eq!(ring.producer_push(&input), 513);
+        assert_eq!(ring.available(), 513);
+        for (index, &expected) in input.iter().enumerate() {
+            assert_eq!(
+                ring.consumer_take_source_sample(),
+                Some(expected),
+                "source sample {index} must preserve FIFO order"
+            );
+        }
+    }
+}
