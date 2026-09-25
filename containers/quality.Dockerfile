@@ -21,7 +21,7 @@ COPY --from=samplerate_adapter_debs librptadv-samplerate-adapter-dev_*.deb /tmp/
 
 RUN dpkg -i /tmp/rptadv-samplerate-adapter/librptadv-samplerate-adapter1_*.deb \
 		/tmp/rptadv-samplerate-adapter/librptadv-samplerate-adapter-dev_*.deb && \
-	pkg-config --atleast-version=0.1.0~alpha1 rptadv_samplerate_adapter && \
+	pkg-config --atleast-version=0.1.0~alpha3 rptadv_samplerate_adapter && \
 	rm -rf /tmp/rptadv-samplerate-adapter
 
 RUN case "${TARGETARCH}" in \

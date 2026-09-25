@@ -6,23 +6,11 @@
 //! locks, logs, or performs I/O after construction.
 
 use core::cell::UnsafeCell;
-use core::ffi::c_int;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
+use crate::plc::Plc;
 use crate::samplerate_adapter::{AdapterFunctions, Converter};
 
-/// Lowest speech pitch evaluated by the generic concealment algorithm.
-const PLC_MIN_PITCH_HZ: u32 = 60;
-/// Highest speech pitch evaluated by the generic concealment algorithm.
-const PLC_MAX_PITCH_HZ: u32 = 400;
-/// Recent waveform span used to compare possible pitch periods.
-const PLC_ANALYSIS_MS: u32 = 5;
-/// Equal-power waveform transition at loss and recovery boundaries.
-const PLC_CROSSFADE_MS: u32 = 8;
-/// Full-level continuation period before a sustained loss begins fading.
-const PLC_HOLD_MS: u32 = 10;
-/// Crossfade duration after the initial continuation before silence.
-const PLC_FADE_MS: u32 = 10;
 /// Maximum input/output chunk handed to the persistent converter per refill.
 const CONVERTER_QUANTUM: usize = 256;
 /// Smallest workspace that can grow once after a zero-progress SRC call.
@@ -34,37 +22,80 @@ const MINIMUM_RATIO: f64 = 1.0 / 256.0;
 /// Dynamic adapter's documented upper bound for a continuing conversion ratio.
 const MAXIMUM_RATIO: f64 = 256.0;
 
-/// Stable selector values accepted by the public C ABI.
-///
-/// The required samplerate adapter currently maps every value to `SRC_LINEAR`.
+/// Concealment selected once when creating the consumer's workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Quality {
-    /// Former highest-quality selector, retained for ABI compatibility.
-    Best,
-    /// Former balanced selector, retained for ABI compatibility.
-    Medium,
-    /// Former low-latency selector, retained for ABI compatibility.
-    Fastest,
+pub(crate) enum PlcMode {
+    /// Missing output is silence without a lookahead delay or PLC workspace.
+    Disabled,
+    /// Sample-domain G.711 Appendix I at the output sample rate.
+    G711AppendixI,
 }
 
-impl Quality {
-    /// Parse the stable C ABI numeric representation.
+impl PlcMode {
+    /// Reject unpublished selectors at the C boundary.
     pub(crate) fn from_ffi(value: u32) -> Result<Self, ()> {
         match value {
-            0 => Ok(Self::Best),
-            1 => Ok(Self::Medium),
-            2 => Ok(Self::Fastest),
+            0 => Ok(Self::Disabled),
+            1 => Ok(Self::G711AppendixI),
             _ => Err(()),
         }
     }
+}
 
-    /// Return the stable selector value consumed by the samplerate adapter.
-    const fn as_adapter(self) -> c_int {
-        match self {
-            Self::Best => 0,
-            Self::Medium => 1,
-            Self::Fastest => 2,
+/// Immutable input-domain buffer policy and maximum public block sizes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Settings {
+    pub(crate) capacity: u64,
+    pub(crate) input_rate_hz: u32,
+    pub(crate) output_rate_hz: u32,
+    pub(crate) reserve: u64,
+    pub(crate) target: u64,
+    /// Largest producer block, in input samples.
+    pub(crate) max_producer: u64,
+    /// Largest consumer block, in output samples.
+    pub(crate) max_output: u64,
+    pub(crate) plc: PlcMode,
+}
+
+impl Settings {
+    /// Validate source headroom for a worst-ratio callback and producer burst.
+    pub(crate) fn validate(&self) -> Result<(), CreateError> {
+        let invalid = CreateError::Invalid;
+        let ratio = f64::from(self.output_rate_hz) / f64::from(self.input_rate_hz);
+        if !(MINIMUM_CAPACITY as u64..=MAXIMUM_CAPACITY as u64).contains(&self.capacity)
+            || self.input_rate_hz == 0
+            || self.output_rate_hz == 0
+            || !(MINIMUM_RATIO..=MAXIMUM_RATIO).contains(&ratio)
+            || self.reserve > self.capacity
+            || self.target > self.capacity
+            || self.max_producer == 0
+            || self.max_output == 0
+            || self.max_producer > isize::MAX as u64 / size_of::<f32>() as u64
+            || self.max_output > isize::MAX as u64 / size_of::<f32>() as u64
+        {
+            return Err(invalid);
         }
+        if self.plc == PlcMode::G711AppendixI {
+            // Use integer rational arithmetic so an exact boundary cannot be
+            // rounded down by floating-point source/output rate conversion.
+            let numerator = u128::from(self.output_rate_hz) * 999;
+            let denominator = u128::from(self.input_rate_hz) * 1000;
+            let budget = if numerator * 256 < denominator {
+                self.max_output as u128 * 256
+            } else {
+                (self.max_output as u128 * denominator).div_ceil(numerator)
+            } + 1;
+            // Widen before arithmetic; sums/products of validated u64/u32
+            // counts fit u128 even at the public interface's largest values.
+            let space = u128::from(self.target) + u128::from(self.max_producer);
+            if u128::from(self.reserve) < budget
+                || self.target < self.reserve
+                || space > u128::from(self.capacity)
+            {
+                return Err(invalid);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -75,19 +106,19 @@ pub(crate) struct Observation {
     pub(crate) capacity_samples: u64,
     /// Source samples currently readable by the consumer.
     pub(crate) available_samples: u64,
-    /// Latest caller-selected playout priming floor.
+    /// Immutable source-sample playout priming floor.
     pub(crate) reserve_samples: u64,
     /// Low-pass filtered source occupancy.
     pub(crate) filtered_occupancy_samples: u64,
-    /// Latest occupancy target used by the slow controller.
+    /// Immutable source-sample target used by the slow controller.
     pub(crate) target_samples: u64,
     /// Applied conversion-ratio correction relative to nominal rate.
     pub(crate) ratio_correction_ppm: i32,
     /// Input samples rejected because unread storage was full.
     pub(crate) discarded_samples: u64,
-    /// Output samples replaced by concealment.
+    /// Converter shortfalls, excluding intentional priming and PLC lookahead.
     pub(crate) missing_samples: u64,
-    /// Consecutive output samples currently concealed.
+    /// Current consecutive converter-shortfall run in output samples.
     pub(crate) consecutive_shortfall_samples: u64,
     /// Ten-second moving average of consecutive shortfall in millisamples.
     pub(crate) shortfall_average_milli: u64,
@@ -96,8 +127,10 @@ pub(crate) struct Observation {
 }
 
 /// Control-plane creation failure classified for the stable C ABI.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CreateError {
+    /// Buffer geometry, rates or callback bounds are invalid.
+    Invalid,
     /// Preallocated Rust storage could not be reserved.
     NoMemory,
     /// The required dynamic converter adapter could not initialize.
@@ -119,17 +152,11 @@ struct ConsumerState {
     converter: Converter,
     input: Box<[f32]>,
     output: Box<[f32]>,
-    history: Box<[f32]>,
-    plc_waveform: Box<[f32]>,
     input_offset: usize,
     input_pending: usize,
     output_offset: usize,
     output_pending: usize,
-    history_length: usize,
-    history_next: usize,
-    plc_period: usize,
-    plc_samples: usize,
-    recovery_samples: usize,
+    plc: Option<Plc>,
     zero_progress: bool,
     occupancy_milli: u64,
     ratio: f64,
@@ -143,8 +170,6 @@ struct Workspaces {
     storage: Box<[UnsafeCell<f32>]>,
     input: Box<[f32]>,
     output: Box<[f32]>,
-    history: Box<[f32]>,
-    plc_waveform: Box<[f32]>,
 }
 
 /// Lock-free producer/consumer state and consumer-only DSP workspace.
@@ -167,13 +192,15 @@ pub(crate) struct Ring {
     consecutive_shortfall: AtomicU64,
     /// Internal precision prevents a one-sample EMA update rounding to zero.
     shortfall_average_micro: AtomicU64,
-    reserve_samples: AtomicU64,
-    target_samples: AtomicU64,
+    reserve_samples: u64,
+    target_samples: u64,
     filtered_occupancy_milli: AtomicU64,
     ratio_correction_ppm: AtomicI32,
     adapter_error_count: AtomicU64,
     input_rate_hz: u32,
     output_rate_hz: u32,
+    max_producer: usize,
+    max_output: usize,
     consumer: UnsafeCell<ConsumerState>,
 }
 
@@ -186,30 +213,32 @@ unsafe impl Sync for Ring {}
 impl Ring {
     /// Allocate a ring and its converter before either real-time endpoint runs.
     pub(crate) fn create(
-        capacity: usize,
-        input_rate_hz: u32,
-        output_rate_hz: u32,
-        quality: Quality,
+        settings: Settings,
         adapter: AdapterFunctions,
     ) -> Result<Self, CreateError> {
-        if !(MINIMUM_CAPACITY..=MAXIMUM_CAPACITY).contains(&capacity)
-            || input_rate_hz == 0
-            || output_rate_hz == 0
-        {
-            return Err(CreateError::NoMemory);
-        }
-
+        settings.validate()?;
+        let Settings {
+            capacity,
+            input_rate_hz,
+            output_rate_hz,
+            ..
+        } = settings;
+        let capacity = capacity as usize;
+        let plc = match settings.plc {
+            PlcMode::Disabled => None,
+            PlcMode::G711AppendixI => {
+                Some(Plc::new(output_rate_hz).map_err(|()| CreateError::NoMemory)?)
+            }
+        };
         let Workspaces {
             storage,
             input,
             output,
-            history,
-            plc_waveform,
         } = match allocate_workspaces(capacity) {
             Ok(workspaces) => workspaces,
             Err(()) => return Err(CreateError::NoMemory),
         };
-        let converter = match adapter.create_converter(quality.as_adapter()) {
+        let converter = match adapter.create_converter(0) {
             Ok(converter) => converter,
             Err(()) => return Err(CreateError::Adapter),
         };
@@ -223,28 +252,24 @@ impl Ring {
             missing: AtomicU64::new(0),
             consecutive_shortfall: AtomicU64::new(0),
             shortfall_average_micro: AtomicU64::new(0),
-            reserve_samples: AtomicU64::new(0),
-            target_samples: AtomicU64::new(0),
+            reserve_samples: settings.reserve,
+            target_samples: settings.target,
             filtered_occupancy_milli: AtomicU64::new(0),
             ratio_correction_ppm: AtomicI32::new(0),
             adapter_error_count: AtomicU64::new(0),
             input_rate_hz,
             output_rate_hz,
+            max_producer: settings.max_producer as usize,
+            max_output: settings.max_output as usize,
             consumer: UnsafeCell::new(ConsumerState {
                 converter,
                 input,
                 output,
-                history,
-                plc_waveform,
                 input_offset: 0,
                 input_pending: 0,
                 output_offset: 0,
                 output_pending: 0,
-                history_length: 0,
-                history_next: 0,
-                plc_period: 0,
-                plc_samples: 0,
-                recovery_samples: 0,
+                plc,
                 zero_progress: false,
                 occupancy_milli: 0,
                 ratio: 0.0,
@@ -306,64 +331,63 @@ impl Ring {
         Some(sample)
     }
 
-    /// Render one hardware-paced sample through persistent conversion.
-    pub(crate) fn consumer_render_sample(&self, target_samples: u64) -> (f32, bool, bool) {
-        self.target_samples.store(target_samples, Ordering::Relaxed);
-        let output_rate_hz = self.output_rate_hz;
-        // This mutable state is exclusively consumer-owned by the public SPSC
-        // contract.  Producer calls cannot access it.
-        let state = unsafe { &mut *self.consumer.get() };
-        let refill = state.refill_output(self, target_samples);
-        if !matches!(refill, RefillResult::Ready) {
-            let output = state.conceal_one(output_rate_hz, self.capacity);
-            self.record_shortfall(true);
-            let adapter_error = matches!(refill, RefillResult::AdapterError);
-            if adapter_error {
-                saturating_add_counter(&self.adapter_error_count, 1);
-            }
-            return (output, false, adapter_error);
-        }
-
-        let sample = state.output[state.output_offset];
-        state.output_offset += 1;
-        state.output_pending -= 1;
-        if state.output_pending == 0 {
-            state.output_offset = 0;
-        }
-        let output = state.recover_one(sample, output_rate_hz);
-        state.remember_output(output, self.capacity);
-        self.record_shortfall(false);
-        (output, true, false)
+    /// Maximum accepted producer call size, in input samples.
+    pub(crate) fn max_producer_samples(&self) -> usize {
+        self.max_producer
     }
 
-    /// Render an arbitrary native PCM block without a fixed callback duration.
-    pub(crate) fn consumer_render(
-        &self,
-        output: &mut [f32],
-        reserve_samples: u64,
-        target_samples: u64,
-    ) -> (u64, bool) {
-        self.reserve_samples
-            .store(reserve_samples, Ordering::Relaxed);
+    /// Maximum accepted consumer call size, in output samples.
+    pub(crate) fn max_output_samples(&self) -> usize {
+        self.max_output
+    }
+
+    /// Render one output sample using the same priming policy as block playout.
+    pub(crate) fn consumer_render_sample(&self) -> (f32, bool, bool) {
+        // Only the single consumer accesses the converter, lookahead and PLC.
+        let state = unsafe { &mut *self.consumer.get() };
+        if !state.primed && !state.reset_failed {
+            if self.available() < self.reserve_samples {
+                return (0.0, false, false);
+            }
+            state.primed = true;
+        }
+        let refill = state.refill_output(self, self.target_samples);
+        let failed = matches!(refill, RefillResult::AdapterError);
+        let input = if matches!(refill, RefillResult::Ready) {
+            let sample = state.output[state.output_offset];
+            state.output_offset += 1;
+            state.output_pending -= 1;
+            if state.output_pending == 0 {
+                state.output_offset = 0;
+            }
+            Some(canonicalize(sample))
+        } else {
+            None
+        };
+        self.record_shortfall(input.is_none());
+        if failed {
+            saturating_add_counter(&self.adapter_error_count, 1);
+        }
+        // Reset failures silence all output; the reset has already cleared PLC.
+        let (output, real) = if state.reset_failed {
+            (0.0, false)
+        } else {
+            match &mut state.plc {
+                Some(plc) => plc.process(input),
+                None => (input.unwrap_or(0.0), input.is_some()),
+            }
+        };
+        (output, real, failed)
+    }
+
+    /// Render a validated native PCM block without callback-size assumptions.
+    pub(crate) fn consumer_render(&self, output: &mut [f32]) -> (u64, bool) {
         let mut real_samples = 0_u64;
         let mut adapter_error = false;
         for sample in output {
-            // A new burst is intentionally held until it has enough lookback
-            // for squelch and DTMF decisions. This is silence, not PLC: no
-            // source PCM has been lost yet.
-            let primed = unsafe { &mut *self.consumer.get() };
-            if !primed.primed && !primed.reset_failed {
-                if self.available() < reserve_samples {
-                    *sample = 0.0;
-                    continue;
-                }
-                primed.primed = true;
-            }
-            let (rendered, real, errored) = self.consumer_render_sample(target_samples);
+            let (rendered, real, errored) = self.consumer_render_sample();
             *sample = rendered;
-            if real {
-                real_samples = real_samples.saturating_add(1);
-            }
+            real_samples += u64::from(real);
             adapter_error |= errored;
         }
         (real_samples, adapter_error)
@@ -397,10 +421,10 @@ impl Ring {
         Observation {
             capacity_samples: self.capacity_u64,
             available_samples: self.available(),
-            reserve_samples: self.reserve_samples.load(Ordering::Relaxed),
+            reserve_samples: self.reserve_samples,
             filtered_occupancy_samples: self.filtered_occupancy_milli.load(Ordering::Relaxed)
                 / 1000,
-            target_samples: self.target_samples.load(Ordering::Relaxed),
+            target_samples: self.target_samples,
             ratio_correction_ppm: self.ratio_correction_ppm.load(Ordering::Relaxed),
             discarded_samples: self.discarded.load(Ordering::Relaxed),
             missing_samples: self.missing.load(Ordering::Relaxed),
@@ -447,11 +471,9 @@ impl ConsumerState {
         self.input_pending = 0;
         self.output_offset = 0;
         self.output_pending = 0;
-        self.history_length = 0;
-        self.history_next = 0;
-        self.plc_period = 0;
-        self.plc_samples = 0;
-        self.recovery_samples = 0;
+        if let Some(plc) = &mut self.plc {
+            plc.reset();
+        }
         self.zero_progress = false;
         self.occupancy_milli = 0;
         self.ratio = 0.0;
@@ -564,122 +586,6 @@ impl ConsumerState {
             .copy_within(self.input_offset..self.input_offset + self.input_pending, 0);
         self.input_offset = 0;
     }
-
-    /// Retain actual playout for bounded later pitch-period continuation.
-    fn remember_output(&mut self, sample: f32, capacity: usize) {
-        self.history[self.history_next] = sample;
-        self.history_next = (self.history_next + 1) % capacity;
-        self.history_length = self.history_length.saturating_add(1).min(capacity);
-    }
-
-    /// Read one historical waveform sample before the next insertion cursor.
-    fn history_back(&self, distance: usize, capacity: usize) -> f32 {
-        let offset = distance % capacity;
-        self.history[(self.history_next + capacity - offset) % capacity]
-    }
-
-    /// Detect the least-error voiced period in recent real playout history.
-    fn detect_pitch(&self, output_rate_hz: u32, capacity: usize) -> usize {
-        let mut minimum = (output_rate_hz / PLC_MAX_PITCH_HZ) as usize;
-        let maximum = (output_rate_hz / PLC_MIN_PITCH_HZ) as usize;
-        let mut window = milliseconds_to_samples(output_rate_hz, PLC_ANALYSIS_MS);
-        let mut resolution = (output_rate_hz / 48_000) as usize;
-        if minimum == 0 {
-            minimum = 1;
-        }
-        if window == 0 {
-            window = 1;
-        }
-        if resolution == 0 {
-            resolution = 1;
-        }
-        if maximum < minimum || self.history_length < maximum.saturating_add(window) {
-            return 0;
-        }
-        let mut best_error = f64::INFINITY;
-        let mut best_period = 0;
-        let mut period = minimum;
-        while period <= maximum {
-            let mut error = 0.0_f64;
-            let mut index = 0;
-            while index < window {
-                let difference = self.history_back(index + 1, capacity)
-                    - self.history_back(index + period + 1, capacity);
-                error += f64::from(difference.abs());
-                index = index.saturating_add(resolution);
-            }
-            if error < best_error {
-                best_error = error;
-                best_period = period;
-            }
-            period = period.saturating_add(resolution);
-        }
-        best_period
-    }
-
-    /// Render one pitch-continuation sample, including bounded decay.
-    fn concealed_sample(&self, position: usize, output_rate_hz: u32) -> f32 {
-        if self.plc_period == 0 {
-            return 0.0;
-        }
-        let phase = position % self.plc_period;
-        let sample = self.plc_waveform[phase];
-        attenuate_concealment(sample, position, output_rate_hz)
-    }
-
-    /// Produce one concealed sample after an input shortfall.
-    fn conceal_one(&mut self, output_rate_hz: u32, capacity: usize) -> f32 {
-        if self.plc_samples == 0 {
-            self.plc_period = self.detect_pitch(output_rate_hz, capacity);
-            self.capture_plc_waveform(capacity);
-        }
-        self.recovery_samples = 0;
-        let position = self.plc_samples;
-        let mut sample = self.concealed_sample(position, output_rate_hz);
-        let crossfade = milliseconds_to_samples(output_rate_hz, PLC_CROSSFADE_MS);
-        if crossfade != 0 && position < crossfade {
-            let previous = if self.history_length == 0 {
-                0.0
-            } else {
-                self.history_back(1, capacity)
-            };
-            sample = equal_power_mix(previous, sample, position, crossfade);
-        }
-        self.plc_samples = self.plc_samples.saturating_add(1);
-        canonicalize(sample)
-    }
-
-    /// Snapshot the detected period before real output mutates history again.
-    fn capture_plc_waveform(&mut self, capacity: usize) {
-        for phase in 0..self.plc_period {
-            self.plc_waveform[phase] = self.history_back(self.plc_period - phase, capacity);
-        }
-    }
-
-    /// Smooth one real converted sample back from an active concealment run.
-    fn recover_one(&mut self, sample: f32, output_rate_hz: u32) -> f32 {
-        if self.plc_samples == 0 {
-            return canonicalize(sample);
-        }
-        let crossfade = milliseconds_to_samples(output_rate_hz, PLC_CROSSFADE_MS);
-        if crossfade == 0 {
-            self.plc_period = 0;
-            self.plc_samples = 0;
-            return canonicalize(sample);
-        }
-        if self.recovery_samples == 0 {
-            self.recovery_samples = crossfade;
-        }
-        let index = crossfade - self.recovery_samples;
-        let continued = self.concealed_sample(self.plc_samples + index, output_rate_hz);
-        let mixed = equal_power_mix(continued, sample, index, crossfade);
-        self.recovery_samples -= 1;
-        if self.recovery_samples == 0 {
-            self.plc_period = 0;
-            self.plc_samples = 0;
-        }
-        canonicalize(mixed)
-    }
 }
 
 /// Allocate a boxed canonical PCM workspace without panicking on OOM.
@@ -698,8 +604,6 @@ fn allocate_workspaces(capacity: usize) -> Result<Workspaces, ()> {
         storage: allocate_storage(capacity)?,
         input: allocate_samples(capacity)?,
         output: allocate_samples(capacity)?,
-        history: allocate_samples(capacity)?,
-        plc_waveform: allocate_samples(capacity)?,
     })
 }
 
@@ -720,11 +624,6 @@ fn saturating_add_counter(counter: &AtomicU64, value: u64) -> u64 {
     next
 }
 
-/// Convert a duration to output-rate samples without a callback-size assumption.
-fn milliseconds_to_samples(rate_hz: u32, milliseconds: u32) -> usize {
-    (u64::from(rate_hz).saturating_mul(u64::from(milliseconds)) / 1000) as usize
-}
-
 /// Constrain public PCM to the canonical finite normalized range.
 fn canonicalize(sample: f32) -> f32 {
     if sample.is_finite() {
@@ -732,28 +631,6 @@ fn canonicalize(sample: f32) -> f32 {
     } else {
         0.0
     }
-}
-
-/// Apply the bounded continuation envelope with no integer PCM conversion.
-pub(crate) fn attenuate_concealment(sample: f32, position: usize, output_rate_hz: u32) -> f32 {
-    let hold = milliseconds_to_samples(output_rate_hz, PLC_HOLD_MS);
-    let fade = milliseconds_to_samples(output_rate_hz, PLC_FADE_MS);
-    if fade == 0 || position <= hold {
-        return sample;
-    }
-    let end = hold.saturating_add(fade);
-    if position >= end {
-        return 0.0;
-    }
-    sample * (end - position) as f32 / fade as f32
-}
-
-/// Blend waveform segments with equal-power f64 control math.
-fn equal_power_mix(outgoing: f32, incoming: f32, index: usize, samples: usize) -> f32 {
-    let progress = (index as f64 + 1.0) / (samples as f64 + 1.0);
-    let mixed =
-        (1.0 - progress).sqrt() * f64::from(outgoing) + progress.sqrt() * f64::from(incoming);
-    canonicalize(mixed as f32)
 }
 
 #[cfg(test)]

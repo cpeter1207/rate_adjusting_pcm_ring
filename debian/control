@@ -7,18 +7,19 @@ Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/rate_adjusting_pcm_ring
 Rules-Requires-Root: no
 
-Package: librate-adjusting-pcm-ring2
+Package: librate-adjusting-pcm-ring3
 Architecture: amd64 arm64
 Multi-Arch: same
 Depends: ${misc:Depends}, ${shlibs:Depends}, librptadv-samplerate-adapter1 (>= 0.1.0~alpha3)
 Description: lock-free canonical-F32 rate-adjusting PCM ring
  Rust shared library for single-producer/single-consumer PCM playout with
- persistent sample-rate conversion, clock recovery, and bounded concealment.
+ persistent sample-rate conversion, clock recovery, and selectable
+ G.711 Appendix I loss concealment.
 
-Package: librate-adjusting-pcm-ring2-dev
+Package: librate-adjusting-pcm-ring3-dev
 Architecture: amd64 arm64
 Multi-Arch: same
-Depends: ${misc:Depends}, librate-adjusting-pcm-ring2 (= ${binary:Version})
+Depends: ${misc:Depends}, librate-adjusting-pcm-ring3 (= ${binary:Version})
 Description: development files for the F32 rate-adjusting PCM ring
  Public descriptor header and pkg-config metadata for consumers of the
- dynamically linked ABI-major-2 canonical-F32 PCM ring.
+ dynamically linked ABI-major-3 canonical-F32 PCM ring.

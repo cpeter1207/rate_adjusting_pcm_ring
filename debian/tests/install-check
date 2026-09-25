@@ -4,11 +4,22 @@ set -eu
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' 0 HUP INT TERM
 
-pkg-config --exists rate_adjusting_pcm_ring2
+pkg-config --exists rate_adjusting_pcm_ring3
+library_dir=$(pkg-config --variable=libdir rate_adjusting_pcm_ring3)
+library="$library_dir/librate_adjusting_pcm_ring3.so.3"
+readelf -d "$library" | grep -F 'librate_adjusting_pcm_ring3.so.3'
+readelf -d "$library" | grep -F 'librptadv_samplerate_adapter.so.1'
+if readelf -d "$library" | grep -F 'libsamplerate.so'; then
+    exit 1
+fi
+readelf --dyn-syms --wide "$library" | grep -E '[[:space:]]rpcr3_descriptor$'
+if readelf --dyn-syms --wide "$library" | grep -E '[[:space:]]rpcr2_descriptor$'; then
+    exit 1
+fi
 
-pkg-config --cflags --libs rate_adjusting_pcm_ring2 | \
+pkg-config --cflags --libs rate_adjusting_pcm_ring3 | \
     xargs cc -std=c11 -Wall -Wextra -Werror tests/descriptor_smoke.c \
         -o "$test_dir/descriptor-smoke"
 "$test_dir/descriptor-smoke"
 
-test -z "$(find /usr/lib -type f -name 'librate_adjusting_pcm_ring2.a' -print -quit)"
+test -z "$(find /usr/lib -type f -name 'librate_adjusting_pcm_ring3.a' -print -quit)"

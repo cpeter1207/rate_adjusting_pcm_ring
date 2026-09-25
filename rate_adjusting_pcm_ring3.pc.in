@@ -3,10 +3,10 @@ exec_prefix=${prefix}
 libdir=@LIBDIR@
 includedir=${prefix}/include
 
-Name: rate_adjusting_pcm_ring2
+Name: rate_adjusting_pcm_ring3
 Description: Lock-free canonical-F32 rate-adjusting PCM ring
 Version: @VERSION@
 # The adapter is an ABI-private runtime dependency declared by the Debian
 # runtime package.  This shared-object-only API does not expose its header.
-Libs: -L${libdir} -lrate_adjusting_pcm_ring2
+Libs: -L${libdir} -lrate_adjusting_pcm_ring3
 Cflags: -I${includedir}

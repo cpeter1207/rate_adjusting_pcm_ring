@@ -1,4 +1,4 @@
-//! Rust implementation of the rate-adjusting PCM ring ABI major two.
+//! Rust implementation of the rate-adjusting PCM ring ABI major three.
 //!
 //! The exported C descriptor keeps Rust types and allocation details private.
 //! PCM crossing this ABI is mono canonical `f32` in the inclusive normalized
@@ -8,8 +8,9 @@
 #![cfg_attr(not(target_has_atomic = "64"), allow(dead_code))]
 
 #[cfg(not(target_has_atomic = "64"))]
-compile_error!("rate_adjusting_pcm_ring2 requires lock-free 64-bit atomics");
+compile_error!("rate_adjusting_pcm_ring3 requires lock-free 64-bit atomics");
 
+mod plc;
 mod ring;
 mod samplerate_adapter;
 
@@ -18,10 +19,10 @@ use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use std::alloc::{Layout, alloc, dealloc};
 
-use ring::{CreateError, MAXIMUM_CAPACITY, MINIMUM_CAPACITY, Observation, Quality, Ring};
+use ring::{CreateError, Observation, PlcMode, Ring, Settings};
 
 /// ABI major implemented by this opaque descriptor.
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 /// Successful descriptor-operation result.
 const RESULT_OK: c_int = 0;
 /// Descriptor-operation result for an invalid caller argument.
@@ -35,7 +36,7 @@ const CAPABILITY_NAME: &[u8] = b"rptadv.rate-adjusting-pcm-ring.f32\0";
 
 /// Opaque C handle containing the Rust-owned rate-adjusting ring.
 #[repr(C)]
-pub struct Rpcr2Ring {
+pub struct Rpcr3Ring {
     ring: Ring,
 }
 
@@ -47,7 +48,11 @@ struct Config {
     capacity_samples: u64,
     input_rate_hz: u32,
     output_rate_hz: u32,
-    quality: u32,
+    reserve_samples: u64,
+    target_samples: u64,
+    max_producer_samples: u64,
+    max_output_samples: u64,
+    plc_mode: u32,
 }
 
 /// C-compatible best-effort ring measurement snapshot.
@@ -71,21 +76,21 @@ struct CObservation {
 }
 
 /// C function type that constructs one stopped ring.
-type RingCreate = extern "C" fn(*const Config, *mut *mut Rpcr2Ring) -> c_int;
+type RingCreate = extern "C" fn(*const Config, *mut *mut Rpcr3Ring) -> c_int;
 /// C function type that tears down one stopped ring.
-type RingDestroy = extern "C" fn(*mut Rpcr2Ring);
+type RingDestroy = extern "C" fn(*mut Rpcr3Ring);
 /// C function type that writes one producer sample.
-type ProducerPushSample = extern "C" fn(*mut Rpcr2Ring, f32, *mut bool) -> c_int;
+type ProducerPushSample = extern "C" fn(*mut Rpcr3Ring, f32, *mut bool) -> c_int;
 /// C function type that writes a chronological producer block.
-type ProducerPush = extern "C" fn(*mut Rpcr2Ring, *const f32, u64, *mut u64) -> c_int;
+type ProducerPush = extern "C" fn(*mut Rpcr3Ring, *const f32, u64, *mut u64) -> c_int;
 /// C function type that renders one converted output sample.
-type ConsumerRenderSample = extern "C" fn(*mut Rpcr2Ring, *mut f32, u64, *mut bool) -> c_int;
+type ConsumerRenderSample = extern "C" fn(*mut Rpcr3Ring, *mut f32, *mut bool) -> c_int;
 /// C function type that renders an arbitrary converted output block.
-type ConsumerRender = extern "C" fn(*mut Rpcr2Ring, *mut f32, u64, u64, u64, *mut u64) -> c_int;
+type ConsumerRender = extern "C" fn(*mut Rpcr3Ring, *mut f32, u64, *mut u64) -> c_int;
 /// C function type that discards a completed burst before the next prime.
-type ConsumerReset = extern "C" fn(*mut Rpcr2Ring) -> c_int;
+type ConsumerReset = extern "C" fn(*mut Rpcr3Ring) -> c_int;
 /// C function type that copies a diagnostic snapshot.
-type Observe = extern "C" fn(*const Rpcr2Ring, *mut CObservation) -> c_int;
+type Observe = extern "C" fn(*const Rpcr3Ring, *mut CObservation) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -108,54 +113,44 @@ pub struct Descriptor {
 unsafe impl Sync for Descriptor {}
 
 /// Validate a caller-owned config prefix before copying scalar values.
-unsafe fn checked_config(config: *const Config) -> Result<(u64, u32, u32, Quality), c_int> {
-    let config = unsafe { config.as_ref() }.ok_or(RESULT_INVALID_ARGUMENT)?;
-    if config.struct_size < size_of::<Config>() as u32 || config.abi_version != ABI_VERSION {
-        return Err(RESULT_INVALID_ARGUMENT);
-    }
-    if config.capacity_samples < MINIMUM_CAPACITY as u64
-        || config.capacity_samples > MAXIMUM_CAPACITY as u64
-        || config.input_rate_hz == 0
-        || config.output_rate_hz == 0
+unsafe fn checked_config(config: *const Config) -> Result<Settings, c_int> {
+    let config = NonNull::new(config.cast_mut()).ok_or(RESULT_INVALID_ARGUMENT)?;
+    // Read the size before borrowing the full structure: an older caller may
+    // supply only a smaller, readable prefix.
+    if unsafe { ptr::addr_of!((*config.as_ptr()).struct_size).read() } < size_of::<Config>() as u32
+        || unsafe { ptr::addr_of!((*config.as_ptr()).abi_version).read() } != ABI_VERSION
     {
         return Err(RESULT_INVALID_ARGUMENT);
     }
-    let quality = match Quality::from_ffi(config.quality) {
-        Ok(quality) => quality,
-        Err(()) => return Err(RESULT_INVALID_ARGUMENT),
+    let config = unsafe { config.as_ref() };
+    let settings = Settings {
+        capacity: config.capacity_samples,
+        input_rate_hz: config.input_rate_hz,
+        output_rate_hz: config.output_rate_hz,
+        reserve: config.reserve_samples,
+        target: config.target_samples,
+        max_producer: config.max_producer_samples,
+        max_output: config.max_output_samples,
+        plc: PlcMode::from_ffi(config.plc_mode).map_err(|_| RESULT_INVALID_ARGUMENT)?,
     };
-    let nominal_ratio = f64::from(config.output_rate_hz) / f64::from(config.input_rate_hz);
-    if !(1.0 / 256.0..=256.0).contains(&nominal_ratio) {
-        return Err(RESULT_INVALID_ARGUMENT);
-    }
-    Ok((
-        config.capacity_samples,
-        config.input_rate_hz,
-        config.output_rate_hz,
-        quality,
-    ))
+    settings.validate().map_err(|_| RESULT_INVALID_ARGUMENT)?;
+    Ok(settings)
 }
 
-/// Convert a nonzero C sample count into one immutable input slice.
+/// Borrow input after the public entrypoint checks its validated block bound.
 unsafe fn checked_input<'a>(input: *const f32, samples: u64) -> Result<&'a [f32], c_int> {
     if samples == 0 {
         return Ok(&[]);
-    }
-    if samples > isize::MAX as u64 / size_of::<f32>() as u64 {
-        return Err(RESULT_INVALID_ARGUMENT);
     }
     let length = samples as usize;
     let input = NonNull::new(input.cast_mut()).ok_or(RESULT_INVALID_ARGUMENT)?;
     Ok(unsafe { core::slice::from_raw_parts(input.as_ptr(), length) })
 }
 
-/// Convert a nonzero C sample count into one mutable output slice.
+/// Borrow output after the public entrypoint checks its validated block bound.
 unsafe fn checked_output<'a>(output: *mut f32, samples: u64) -> Result<&'a mut [f32], c_int> {
     if samples == 0 {
         return Ok(&mut []);
-    }
-    if samples > isize::MAX as u64 / size_of::<f32>() as u64 {
-        return Err(RESULT_INVALID_ARGUMENT);
     }
     let length = samples as usize;
     let output = NonNull::new(output).ok_or(RESULT_INVALID_ARGUMENT)?;
@@ -163,7 +158,7 @@ unsafe fn checked_output<'a>(output: *mut f32, samples: u64) -> Result<&'a mut [
 }
 
 /// Recover a live opaque ring pointer without taking ownership.
-unsafe fn checked_ring<'a>(ring: *mut Rpcr2Ring) -> Result<&'a Rpcr2Ring, c_int> {
+unsafe fn checked_ring<'a>(ring: *mut Rpcr3Ring) -> Result<&'a Rpcr3Ring, c_int> {
     unsafe { ring.as_ref() }.ok_or(RESULT_INVALID_ARGUMENT)
 }
 
@@ -171,14 +166,14 @@ unsafe fn checked_ring<'a>(ring: *mut Rpcr2Ring) -> Result<&'a Rpcr2Ring, c_int>
 fn allocate_ring_handle_with(
     ring: Ring,
     allocator: unsafe fn(Layout) -> *mut u8,
-) -> Result<*mut Rpcr2Ring, ()> {
-    let layout = Layout::new::<Rpcr2Ring>();
-    let handle = unsafe { allocator(layout).cast::<Rpcr2Ring>() };
+) -> Result<*mut Rpcr3Ring, ()> {
+    let layout = Layout::new::<Rpcr3Ring>();
+    let handle = unsafe { allocator(layout).cast::<Rpcr3Ring>() };
     let Some(handle) = NonNull::new(handle) else {
         return Err(());
     };
     unsafe {
-        handle.as_ptr().write(Rpcr2Ring { ring });
+        handle.as_ptr().write(Rpcr3Ring { ring });
     }
     Ok(handle.as_ptr())
 }
@@ -186,7 +181,7 @@ fn allocate_ring_handle_with(
 /// Apply a resolved dynamic adapter to a validated public construction request.
 fn ring_create_with_adapter(
     config: *const Config,
-    output: *mut *mut Rpcr2Ring,
+    output: *mut *mut Rpcr3Ring,
     adapter: Result<samplerate_adapter::AdapterFunctions, ()>,
 ) -> c_int {
     ring_create_with_adapter_and_allocator(config, output, adapter, alloc)
@@ -195,40 +190,37 @@ fn ring_create_with_adapter(
 /// Apply a resolved dynamic adapter through one control-plane handle allocator.
 fn ring_create_with_adapter_and_allocator(
     config: *const Config,
-    output: *mut *mut Rpcr2Ring,
+    output: *mut *mut Rpcr3Ring,
     adapter: Result<samplerate_adapter::AdapterFunctions, ()>,
     allocator: unsafe fn(Layout) -> *mut u8,
 ) -> c_int {
     let Some(output) = NonNull::new(output) else {
         return RESULT_INVALID_ARGUMENT;
     };
+    let settings = match unsafe { checked_config(config) } {
+        Ok(settings) => settings,
+        Err(error) => return error,
+    };
     unsafe {
         *output.as_ptr() = ptr::null_mut();
     }
-    let (capacity, input_rate, output_rate, quality) = match unsafe { checked_config(config) } {
-        Ok(values) => values,
-        Err(error) => return error,
-    };
     let adapter = match adapter {
         Ok(adapter) => adapter,
         Err(()) => return RESULT_ADAPTER_ERROR,
     };
-    finish_ring_create(
-        output,
-        Ring::create(capacity as usize, input_rate, output_rate, quality, adapter),
-        allocator,
-    )
+    finish_ring_create(output, Ring::create(settings, adapter), allocator)
 }
 
 /// Translate construction failures and publish a fully initialized opaque handle.
 fn finish_ring_create(
-    output: NonNull<*mut Rpcr2Ring>,
+    output: NonNull<*mut Rpcr3Ring>,
     ring: Result<Ring, CreateError>,
     allocator: unsafe fn(Layout) -> *mut u8,
 ) -> c_int {
     let ring = match ring {
         Ok(ring) => ring,
         Err(CreateError::NoMemory) => return RESULT_NO_MEMORY,
+        Err(CreateError::Invalid) => return RESULT_INVALID_ARGUMENT,
         Err(CreateError::Adapter) => return RESULT_ADAPTER_ERROR,
     };
     let ring = match allocate_ring_handle_with(ring, allocator) {
@@ -242,24 +234,24 @@ fn finish_ring_create(
 }
 
 /// Construct a ring and its required dynamic converter before audio starts.
-extern "C" fn ring_create(config: *const Config, output: *mut *mut Rpcr2Ring) -> c_int {
+extern "C" fn ring_create(config: *const Config, output: *mut *mut Rpcr3Ring) -> c_int {
     ring_create_with_adapter(config, output, samplerate_adapter::load_functions())
 }
 
 /// Destroy a stopped ring and all control-plane allocations it owns.
-extern "C" fn ring_destroy(ring: *mut Rpcr2Ring) {
+extern "C" fn ring_destroy(ring: *mut Rpcr3Ring) {
     let Some(ring) = NonNull::new(ring) else {
         return;
     };
     unsafe {
         ptr::drop_in_place(ring.as_ptr());
-        dealloc(ring.as_ptr().cast::<u8>(), Layout::new::<Rpcr2Ring>());
+        dealloc(ring.as_ptr().cast::<u8>(), Layout::new::<Rpcr3Ring>());
     }
 }
 
 /// Publish one producer sample and report whether unread storage accepted it.
 extern "C" fn ring_producer_push_sample(
-    ring: *mut Rpcr2Ring,
+    ring: *mut Rpcr3Ring,
     sample: f32,
     accepted: *mut bool,
 ) -> c_int {
@@ -278,7 +270,7 @@ extern "C" fn ring_producer_push_sample(
 
 /// Publish a producer block and report the chronological prefix accepted.
 extern "C" fn ring_producer_push(
-    ring: *mut Rpcr2Ring,
+    ring: *mut Rpcr3Ring,
     input: *const f32,
     samples: u64,
     accepted: *mut u64,
@@ -290,6 +282,9 @@ extern "C" fn ring_producer_push(
         Ok(ring) => ring,
         Err(error) => return error,
     };
+    if samples > ring.ring.max_producer_samples() as u64 {
+        return RESULT_INVALID_ARGUMENT;
+    }
     let input = match unsafe { checked_input(input, samples) } {
         Ok(input) => input,
         Err(error) => return error,
@@ -302,9 +297,8 @@ extern "C" fn ring_producer_push(
 
 /// Render one output sample and report whether it came from converted source PCM.
 extern "C" fn ring_consumer_render_sample(
-    ring: *mut Rpcr2Ring,
+    ring: *mut Rpcr3Ring,
     sample: *mut f32,
-    target_samples: u64,
     real: *mut bool,
 ) -> c_int {
     let Some(sample) = NonNull::new(sample) else {
@@ -317,7 +311,7 @@ extern "C" fn ring_consumer_render_sample(
         Ok(ring) => ring,
         Err(error) => return error,
     };
-    let (rendered, is_real, adapter_error) = ring.ring.consumer_render_sample(target_samples);
+    let (rendered, is_real, adapter_error) = ring.ring.consumer_render_sample();
     unsafe {
         *sample.as_ptr() = rendered;
         *real.as_ptr() = is_real;
@@ -331,11 +325,9 @@ extern "C" fn ring_consumer_render_sample(
 
 /// Render a variable-size output block without a fixed callback-duration assumption.
 extern "C" fn ring_consumer_render(
-    ring: *mut Rpcr2Ring,
+    ring: *mut Rpcr3Ring,
     output: *mut f32,
     samples: u64,
-    reserve_samples: u64,
-    target_samples: u64,
     real_samples: *mut u64,
 ) -> c_int {
     let Some(real_samples) = NonNull::new(real_samples) else {
@@ -345,14 +337,15 @@ extern "C" fn ring_consumer_render(
         Ok(ring) => ring,
         Err(error) => return error,
     };
+    if samples > ring.ring.max_output_samples() as u64 {
+        return RESULT_INVALID_ARGUMENT;
+    }
     let output = match unsafe { checked_output(output, samples) } {
         Ok(output) => output,
         Err(error) => return error,
     };
     unsafe {
-        let (rendered, adapter_error) =
-            ring.ring
-                .consumer_render(output, reserve_samples, target_samples);
+        let (rendered, adapter_error) = ring.ring.consumer_render(output);
         *real_samples.as_ptr() = rendered;
         if adapter_error {
             return RESULT_ADAPTER_ERROR;
@@ -362,7 +355,7 @@ extern "C" fn ring_consumer_render(
 }
 
 /// Discard a completed burst, keeping rendering silent after a reset failure.
-extern "C" fn ring_consumer_reset(ring: *mut Rpcr2Ring) -> c_int {
+extern "C" fn ring_consumer_reset(ring: *mut Rpcr3Ring) -> c_int {
     let ring = match unsafe { checked_ring(ring) } {
         Ok(ring) => ring,
         Err(error) => return error,
@@ -374,7 +367,7 @@ extern "C" fn ring_consumer_reset(ring: *mut Rpcr2Ring) -> c_int {
 }
 
 /// Copy a lock-free best-effort diagnostic snapshot.
-extern "C" fn ring_observe(ring: *const Rpcr2Ring, observation: *mut CObservation) -> c_int {
+extern "C" fn ring_observe(ring: *const Rpcr3Ring, observation: *mut CObservation) -> c_int {
     let ring = match unsafe { checked_ring(ring.cast_mut()) } {
         Ok(ring) => ring,
         Err(error) => return error,
@@ -382,10 +375,12 @@ extern "C" fn ring_observe(ring: *const Rpcr2Ring, observation: *mut CObservatio
     let Some(mut observation) = NonNull::new(observation) else {
         return RESULT_INVALID_ARGUMENT;
     };
-    let observation = unsafe { observation.as_mut() };
-    if observation.struct_size < size_of::<CObservation>() as u32 {
+    if unsafe { ptr::addr_of!((*observation.as_ptr()).struct_size).read() }
+        < size_of::<CObservation>() as u32
+    {
         return RESULT_INVALID_ARGUMENT;
     }
+    let observation = unsafe { observation.as_mut() };
     let values: Observation = ring.ring.observe();
     *observation = CObservation {
         struct_size: size_of::<CObservation>() as u32,
@@ -421,9 +416,9 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_observe,
 };
 
-/// Return the immutable ABI-major-2 descriptor for the Rust ring.
+/// Return the immutable ABI-major-3 descriptor for the Rust ring.
 #[unsafe(no_mangle)]
-pub extern "C" fn rpcr2_descriptor() -> *const Descriptor {
+pub extern "C" fn rpcr3_descriptor() -> *const Descriptor {
     &DESCRIPTOR
 }
 

@@ -1,6 +1,6 @@
 [package]
-name = "rate-adjusting-pcm-ring2"
-version = "2.0.0-alpha.4"
+name = "rate-adjusting-pcm-ring3"
+version = "3.0.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-only"
@@ -9,7 +9,7 @@ repository = "https://github.com/cpeter1207/rate_adjusting_pcm_ring"
 publish = false
 
 [lib]
-name = "rate_adjusting_pcm_ring2"
+name = "rate_adjusting_pcm_ring3"
 crate-type = ["cdylib"]
 
 [profile.release]

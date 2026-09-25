@@ -9,6 +9,6 @@
 /debian/files
 /debian/librate-adjusting-pcm-ring1/
 /debian/librate-adjusting-pcm-ring-dev/
-/debian/librate-adjusting-pcm-ring2/
-/debian/librate-adjusting-pcm-ring2-dev/
+/debian/librate-adjusting-pcm-ring3/
+/debian/librate-adjusting-pcm-ring3-dev/
 /debian/*.substvars

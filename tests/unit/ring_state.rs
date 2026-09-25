@@ -1,14 +1,14 @@
 use super::*;
 use crate::samplerate_adapter::AdapterDescriptor;
 use crate::tests::FAKE_DESCRIPTOR;
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread;
 
 fn ring(capacity: usize) -> Ring {
     let adapter = unsafe { AdapterFunctions::from_descriptor(&FAKE_DESCRIPTOR) }.unwrap();
-    Ring::create(capacity, 8_000, 8_000, Quality::Best, adapter).unwrap()
+    Ring::create(crate::tests::settings(capacity, 8_000, 8_000), adapter).unwrap()
 }
 
 #[test]
@@ -71,26 +71,33 @@ fn failed_reset_silences_cached_and_new_pcm_until_successful_reset() {
         ..FAKE_DESCRIPTOR
     };
     let adapter = unsafe { AdapterFunctions::from_descriptor(&descriptor) }.unwrap();
-    let ring = Ring::create(513, 8_000, 8_000, Quality::Best, adapter).unwrap();
+    let ring = Ring::create(
+        Settings {
+            reserve: 2,
+            ..crate::tests::settings(513, 8_000, 8_000)
+        },
+        adapter,
+    )
+    .unwrap();
     assert_eq!(ring.producer_push(&[0.7; 16]), 16);
     let mut output = [0.0];
-    assert_eq!(ring.consumer_render(&mut output, 1, 0), (1, false));
+    assert_eq!(ring.consumer_render(&mut output), (1, false));
     assert_eq!(output, [0.7]);
 
     FAIL_RESET.store(true, Ordering::Relaxed);
     assert_eq!(ring.consumer_reset(), Err(()));
     assert_eq!(ring.available(), 0);
-    assert_eq!(ring.consumer_render(&mut output, 2, 0), (0, true));
+    assert_eq!(ring.consumer_render(&mut output), (0, true));
     assert_eq!(output, [0.0]);
     assert_eq!(ring.producer_push(&[0.9]), 1);
-    assert_eq!(ring.consumer_render_sample(0), (0.0, false, true));
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
     assert_eq!(ring.available(), 1);
 
     assert_eq!(ring.consumer_reset(), Ok(()));
     assert_eq!(ring.available(), 0);
     assert_eq!(ring.producer_push(&[0.2]), 1);
-    assert_eq!(ring.consumer_render(&mut output, 2, 0), (0, false));
+    assert_eq!(ring.consumer_render(&mut output), (0, false));
     assert_eq!(ring.producer_push(&[0.3]), 1);
-    assert_eq!(ring.consumer_render(&mut output, 2, 0), (1, false));
+    assert_eq!(ring.consumer_render(&mut output), (1, false));
     assert_eq!(output, [0.2]);
 }

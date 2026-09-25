@@ -1,4 +1,5 @@
 PROJECT_NAME = rate-adjusting-pcm-ring
+PROJECT_NUMBER = 3.0.0-alpha.1
 PROJECT_BRIEF = Lock-free canonical-F32 rate-adjusting PCM ring
 INPUT = README.md include build/doxygen-input
 FILE_PATTERNS = *.h *.md *.dox
