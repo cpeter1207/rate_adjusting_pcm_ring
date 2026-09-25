@@ -52,7 +52,7 @@ Replace `TEST_FILTER` with each named test/module below. A failing assertion is 
 
 **Interface:** private `Plc::new(output_rate_hz: u32) -> Result<Plc, ()>`, `Plc::process(input: Option<f32>) -> (f32, bool)`, and `Plc::reset()`. `Some` supplies converted PCM; `None` marks a missing output sample. The returned Boolean classifies emitted real-versus-replacement PCM, including the delayed sample. No public adapter or alternative implementation.
 
-- [ ] Add `plc::tests::good_audio_has_exact_lookahead` first. The following assertions define the 48 kHz case; allocation failure is checked separately.
+- [x] Add `plc::tests::good_audio_has_exact_lookahead` first. The following assertions define the 48 kHz case; allocation failure is checked separately.
 
 ```rust
 let mut plc = Plc::new(48_000).unwrap();
@@ -62,11 +62,11 @@ for _ in 0..180 {
 assert_eq!(plc.process(Some(0.25)), (0.25, true));
 ```
 
-- [ ] Observe failure with a minimal compiling definition, then implement output history and delay using output-rate sizes independent of source FIFO capacity.
-- [ ] Add and run failing tests for the Appendix I pitch-search/overlap behavior, loss-period expansion after 10 and 20 ms, and recovery. Use hand-derived periodic input and published timing, not an implementation-generated golden file.
-- [ ] Test unity loss-envelope gain through 10 ms, 0.8 at 20 ms, 0.2 at 50 ms, and zero at 60 ms, accounting separately for output delay. Check silence and incomplete history without NaN, gain boost or uninitialized samples.
-- [ ] Implement only the tested sample-driven algorithm. Run the same cases at 8 and 48 kHz; compare one-sample and mixed block partitions, and good/bad/good/bad sequences. Reset must remove prior history and delayed output.
-- [ ] Add concise Rustdoc and run `cargo test --locked --lib plc::tests::`. Keep this work in the same implementation checkpoint as Task 3 so the committed library has a real PLC caller and no unused production module or warning suppression.
+- [x] Observe failure with a minimal compiling definition, then implement output history and delay using output-rate sizes independent of source FIFO capacity.
+- [x] Add and run failing tests for the Appendix I pitch-search/overlap behavior, loss-period expansion after 10 and 20 ms, and recovery. Use hand-derived periodic input and published timing, not an implementation-generated golden file.
+- [x] Test unity loss-envelope gain through 10 ms, 0.8 at 20 ms, 0.2 at 50 ms, and zero at 60 ms, accounting separately for output delay. Check silence and incomplete history without NaN, gain boost or uninitialized samples.
+- [x] Implement only the tested sample-driven algorithm. Run the same cases at 8 and 48 kHz; compare one-sample and mixed block partitions, and good/bad/good/bad sequences. Reset must remove prior history and delayed output.
+- [x] Add concise Rustdoc and run `cargo test --locked --lib plc::tests::`. Keep this work in the same implementation checkpoint as Task 3 so the committed library has a real PLC caller and no unused production module or warning suppression.
 
 ## Task 2: Validate immutable ring policy
 
@@ -74,7 +74,7 @@ assert_eq!(plc.process(Some(0.25)), (0.25, true));
 
 **Interfaces:** `PlcMode::{Disabled, G711AppendixI}` with checked numeric parsing; `Settings` containing capacity, input/output rates, reserve, target and maximum producer/consumer counts. `Settings::validate() -> Result<(), CreateError>` implements the approved bounds using checked arithmetic. Add `CreateError::Invalid` alongside the existing allocation/adapter errors to represent rejected settings.
 
-- [ ] Write table-driven tests before validation. Use literal source-sample expectations:
+- [x] Write table-driven tests before validation. Use literal source-sample expectations:
 
 | Input/output Hz | Producer/consumer maximum | Reserve/target/capacity | Expected |
 | --- | --- | --- | --- |
@@ -87,9 +87,9 @@ assert_eq!(plc.process(Some(0.25)), (0.25, true));
 | 48000/48000 | 4096/4096 | 0/0/14400 | Disabled accepted |
 | 48000/48000 | 4096/4096 | 7200/7200/14400 | Disabled accepted |
 
-- [ ] Include unknown mode, zero rates, zero enabled-mode maxima, reserve/target beyond capacity, target below enabled reserve, conversion-ratio endpoints and integer overflow. Preserve valid disabled-mode reserve/target combinations, including target zero.
-- [ ] Observe rejection-test failures, implement the approved formula, and rerun only policy tests. Do not add a controller, auto-sizing behavior or new user tuning options.
-- [ ] Document count units and the conditional one-callback/one-producer-write guarantees. Run affected regression tests; include this work in the buildable Task 3 checkpoint.
+- [x] Include unknown mode, zero rates, zero enabled-mode maxima, reserve/target beyond capacity, target below enabled reserve, conversion-ratio endpoints and integer overflow. Preserve valid disabled-mode reserve/target combinations, including target zero.
+- [x] Observe rejection-test failures, implement the approved formula, and rerun only policy tests. Do not add a controller, auto-sizing behavior or new user tuning options.
+- [x] Document count units and the conditional one-callback/one-producer-write guarantees. Run affected regression tests; include this work in the buildable Task 3 checkpoint.
 
 ## Task 3: Replace the old ring concealment
 
@@ -97,12 +97,12 @@ assert_eq!(plc.process(Some(0.25)), (0.25, true));
 
 **Interface:** `Ring::create(settings: Settings, adapter: AdapterFunctions) -> Result<Ring, CreateError>`. Rendering takes no reserve/target arguments; the ring retains validated immutable settings. Per-sample and block rendering share state. The existing adapter is called with a fixed internal selector; its external ABI is unchanged.
 
-- [ ] First add ring-level tests for disabled shortfall silence, independent history on the 640-input-sample 8-to-48 path, one-sample priming, and enabled 60 ms fade. Demonstrate failures against the old behavior before replacing it.
-- [ ] Wire `Option<Plc>` into the consumer; disabled mode owns no PLC workspace. Delete the old pitch detector, equal-power crossfade, conceal/recover methods, quality enum and obsolete tests once their replacement tests pass.
-- [ ] Enforce maximum block counts before mutation. Retain allowed partial writes, cursor ordering/wrap, reset, error counters and existing rate-control behavior. Zero-length blocks remain harmless.
-- [ ] Verify startup and lookahead do not increment missing-sample counters; real converter shortfalls do, for either PLC mode. Do not re-prime merely because a producer ran short.
-- [ ] Reuse existing allocator/adapter error fixtures only for failure injection. Use the real dynamic samplerate adapter for the source-budget boundary and non-unity conversion tests; the current copy-through fake cannot prove resampling behavior.
-- [ ] Run `cargo test --locked --lib` after targeted tests. Update Rustdoc and commit only after ring tests pass.
+- [x] First add ring-level tests for disabled shortfall silence, independent history on the 640-input-sample 8-to-48 path, one-sample priming, and enabled 60 ms fade. Demonstrate failures against the old behavior before replacing it.
+- [x] Wire `Option<Plc>` into the consumer; disabled mode owns no PLC workspace. Delete the old pitch detector, equal-power crossfade, conceal/recover methods, quality enum and obsolete tests once their replacement tests pass.
+- [x] Enforce maximum block counts before mutation. Retain allowed partial writes, cursor ordering/wrap, reset, error counters and existing rate-control behavior. Zero-length blocks remain harmless.
+- [x] Verify startup and lookahead do not increment missing-sample counters; real converter shortfalls do, for either PLC mode. Do not re-prime merely because a producer ran short.
+- [x] Reuse existing allocator/adapter error fixtures only for failure injection. Use the real dynamic samplerate adapter for the source-budget boundary and non-unity conversion tests; the current copy-through fake cannot prove resampling behavior.
+- [x] Run `cargo test --locked --lib` after targeted tests. Update Rustdoc and commit only after ring tests pass.
 
 ## Task 4: ABI 3 and installation artifacts
 
@@ -110,11 +110,11 @@ assert_eq!(plc.process(Some(0.25)), (0.25, true));
 
 **Interface:** `rpcr3_descriptor()` exposes the same lifecycle and SPSC operation roles, with the new creation policy and render signatures. ABI and SONAME are 3. Mode values are disabled=0 and G.711 Appendix I=1. Remove quality; use a new package identity rather than an old-name compatibility shim.
 
-- [ ] Add executable C/Rust boundary tests for ABI version, structure sizes, null pointers, mode/config rejection, exact returned result codes and unchanged handles/output on invalid calls.
-- [ ] Update the descriptor/header together, compile and run the C consumer against the actual DSO, and verify both PLC modes. Keep all buffer pointers Rust-owned behind the C handle.
-- [ ] Extend staged-install checks to require the ABI-3 SONAME/header/pkg-config artifacts and dynamic samplerate-adapter dependency; reject static archives and accidental ABI-2 exports. Run them before changing packaging so the missing artifacts are observed.
-- [ ] Update Cargo/package identities and artifact checks. Build/install into temporary staging, never a node. Run `make test install-check distcheck` in the native amd64 container. Developer docs must build without warnings; check only affected docs while correcting issues.
-- [ ] Commit the coherent ABI change with its tests and developer documentation.
+- [x] Add executable C/Rust boundary tests for ABI version, structure sizes, null pointers, mode/config rejection, exact returned result codes and unchanged handles/output on invalid calls.
+- [x] Update the descriptor/header together, compile and run the C consumer against the actual DSO, and verify both PLC modes. Keep all buffer pointers Rust-owned behind the C handle.
+- [x] Extend staged-install checks to require the ABI-3 SONAME/header/pkg-config artifacts and dynamic samplerate-adapter dependency; reject static archives and accidental ABI-2 exports. Run them before changing packaging so the missing artifacts are observed.
+- [x] Update Cargo/package identities and artifact checks. Build/install into temporary staging, never a node. Run `make test install-check distcheck` in the native amd64 container. Developer docs must build without warnings; check only affected docs while correcting issues.
+- [x] Commit the coherent ABI change with its tests and developer documentation.
 
 ## Task 5: USBRadioPlus caller policies
 
@@ -122,15 +122,15 @@ assert_eq!(plc.process(Some(0.25)), (0.25, true));
 
 **Interface:** `RingProvider::prepare` receives the ABI-3 settings and explicit PLC mode, not `ConversionQuality`. Station preparation selects enabled app_rpt policy or disabled advanced fallback policy from the existing adapter type. Do not change the direct-callback bypass.
 
-- [ ] Add failing policy/descriptor tests: app_rpt has PLC enabled with 162/320/640 input samples and 160/960 block bounds; advanced fallback disables PLC with its existing timings. Verify ABI-2 rejection and oversized writes/renders without mutation.
-- [ ] Replace the handwritten binding with ABI-3 fields/functions; remove caller quality choices and per-render timing arguments. Update fixture layouts, the C shim dependency and package checks together.
-- [ ] Stage the new shared ring for testing and run:
+- [x] Add failing policy/descriptor tests: app_rpt has PLC enabled with 162/320/640 input samples and 160/960 block bounds; advanced fallback disables PLC with its existing timings. Verify ABI-2 rejection and oversized writes/renders without mutation.
+- [x] Replace the handwritten binding with ABI-3 fields/functions; remove caller quality choices and per-render timing arguments. Update fixture layouts, the C shim dependency and package checks together.
+- [x] Stage the new shared ring for testing and run:
 
 ```sh
 cargo test --locked -p usbradioplus-ring -p usbradioplus-station --lib
 ```
 
-- [ ] Run affected shim, artifact and packaging tests and then the existing workspace test command once. Preserve all processing-chain settings, radio behavior and direct callback flow. Update Rustdoc/C comments before committing.
+- [x] Run affected shim, artifact and packaging tests and then the existing workspace test command once. Preserve all processing-chain settings, radio behavior and direct callback flow. Update Rustdoc/C comments before committing.
 
 ## Task 6: rpt_advanced caller policies
 
@@ -138,10 +138,10 @@ cargo test --locked -p usbradioplus-ring -p usbradioplus-station --lib
 
 **Interface:** Ring construction receives an explicit peer/local policy. Incoming peer creation selects enabled PLC with the approved rate-derived reserve/capacity and unchanged target; local receive selects disabled PLC with its captured squelch delay. Offline media construction explicitly disables PLC and uses zero timing.
 
-- [ ] Add failing tests distinguishing peer, local and offline policy at construction. Test the negotiated 8 kHz example 685/2080/6176, native 48 kHz, local zero/150 ms delay, and source rates used by speech and file conversion.
-- [ ] Update generated bindings and constructor call sites. Remove quality and render-time timing arguments. Do not change same-device reload behavior, create another media queue, or resample again outside the existing ring.
-- [ ] Test missing/offline real output as an error, exact output duration, cancellation and no synthetic samples. Retain consumer/producer generation ownership tests.
-- [ ] Build the existing file/speech adapter DSOs, then run the product ring and media tests using the existing Makefile test environment:
+- [x] Add failing tests distinguishing peer, local and offline policy at construction. Test the negotiated 8 kHz example 685/2080/6176, native 48 kHz, local zero/150 ms delay, and source rates used by speech and file conversion.
+- [x] Update generated bindings and constructor call sites. Remove quality and render-time timing arguments. Do not change same-device reload behavior, create another media queue, or resample again outside the existing ring.
+- [x] Test missing/offline real output as an error, exact output duration, cancellation and no synthetic samples. Retain consumer/producer generation ownership tests.
+- [x] Build the existing file/speech adapter DSOs, then run the product ring and media tests using the existing Makefile test environment:
 
 ```sh
 make rust-build
@@ -153,18 +153,18 @@ LD_LIBRARY_PATH="$PWD/build:${LD_LIBRARY_PATH:-}" \
 cargo test --locked -p rptadv-product --lib media::tests::
 ```
 
-- [ ] Run the existing rpt_advanced suite once after targeted checks, update Rustdoc and commit only this migration. Leave unrelated branch work untouched.
+- [x] Run the existing rpt_advanced suite once after targeted checks, update Rustdoc and commit only this migration. Leave unrelated branch work untouched.
 
 ## Task 7: Composed verification and review
 
 **Files:** new `tests/plc_integration.c` in the ring, its Makefile target, and existing consumer integration tests; ignored progress/coverage logs.
 
-- [ ] Add a dedicated integration test using the actual ABI-3 descriptor and released samplerate adapter. Exercise all five approved policy shapes, real PCM conversion, shortfall, recovery, reset and invalid geometry. The test must consume the real shared object, not replace the ring with a fake.
-- [ ] Compare sample-by-sample and variable-block playout for identical source samples and loss events. Check normalized finite output, chronological real samples, intentional delay, shortfall counters and unchanged disabled-path duration.
-- [ ] Exercise sustained positive/negative clock drift and producer bursts at declared boundaries. Use deterministic simulated clocks; this verifies finite tested conditions, not immunity to arbitrary jitter.
-- [ ] Run each affected complete test suite, staged-install checks and formatting/lint/static analysis. Record every failing test, including pre-existing failures. Close changed-source coverage gaps incrementally without repeatedly running the entire coverage suite.
-- [ ] Obtain an independent final diff review focused on algorithm fidelity, allocation-free callback operation, count units and ABI safety. Fix findings with a failing regression test first.
-- [ ] Report exact tests run, unresolved failures and modified repositories. Do not claim the full GitHub platform gate passed unless a corresponding run actually completed. Stop before push/release/deployment unless separately authorized.
+- [x] Add a dedicated integration test using the actual ABI-3 descriptor and released samplerate adapter. Exercise all five approved policy shapes, real PCM conversion, shortfall, recovery, reset and invalid geometry. The test must consume the real shared object, not replace the ring with a fake.
+- [x] Compare sample-by-sample and variable-block playout for identical source samples and loss events. Check normalized finite output, chronological real samples, intentional delay, shortfall counters and unchanged disabled-path duration.
+- [x] Exercise sustained positive/negative clock drift and producer bursts at declared boundaries. Use deterministic simulated clocks; this verifies finite tested conditions, not immunity to arbitrary jitter.
+- [x] Run each affected complete test suite, staged-install checks and formatting/lint/static analysis. Record every failing test, including pre-existing failures. Close changed-source coverage gaps incrementally without repeatedly running the entire coverage suite.
+- [x] Obtain an independent final diff review focused on algorithm fidelity, allocation-free callback operation, count units and ABI safety. Fix findings with a failing regression test first.
+- [x] Report exact tests run, unresolved failures and modified repositories. Do not claim the full GitHub platform gate passed unless a corresponding run actually completed. Stop before push/release/deployment unless separately authorized.
 
 ## Plan review record
 
@@ -172,4 +172,6 @@ cargo test --locked -p rptadv-product --lib media::tests::
 2. Boundaries: includes independent history, startup/recovery timing, zero-delay disabled paths, actual adapter conversion, maximum blocks, overflow, cursor wrap, wrong ABI, allocation failures and composed checks.
 3. Simplification: one private PLC module, existing ring/settings/error machinery and existing test containers; no new service, dependency, compatibility layer or duplicate resampler. The final integration test depends on Tasks 1 through 6.
 
-Status: implementation plan ready for user review; no production implementation has started.
+Status: implementation and composed local verification complete on 2026-09-25. Ring, USBRadioPlus, rpt_advanced and companion release-workflow changes are committed on isolated local branches. No push, pull request, release, node change or native arm64 gate was performed.
+
+Verification: 44 ring tests with 100% production line/branch coverage; actual shared-object caller and clock-drift integration; Debian amd64 package/staged-install checks; 479 USBRadioPlus Rust tests and 94 Python tests; 436 rpt_advanced Rust tests and C loader checks; both consumer staged installations; strict affected formatting, lint, static analysis and developer documentation. Workflow archive contracts cover amd64/arm64 artifact names without claiming native arm64 execution. Independent review identified a recovery-overlap defect; its failing regression and correction passed before completion. Evidence remains in each checkout's ignored `.work/g711-plc/` directory. Operator documentation and the native GitHub platform gate remain for PR preparation.
