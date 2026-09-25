@@ -2,7 +2,7 @@ Source: rate-adjusting-pcm-ring
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
-Build-Depends: cargo, debhelper-compat (= 13), librptadv-samplerate-adapter-dev (>= 0.1.0~alpha1), pkg-config, rustc
+Build-Depends: cargo, debhelper-compat (= 13), librptadv-samplerate-adapter-dev (>= 0.1.0~alpha3), pkg-config, rustc
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/rate_adjusting_pcm_ring
 Rules-Requires-Root: no
@@ -10,7 +10,7 @@ Rules-Requires-Root: no
 Package: librate-adjusting-pcm-ring2
 Architecture: amd64 arm64
 Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}, librptadv-samplerate-adapter1 (>= 0.1.0~alpha1)
+Depends: ${misc:Depends}, ${shlibs:Depends}, librptadv-samplerate-adapter1 (>= 0.1.0~alpha3)
 Description: lock-free canonical-F32 rate-adjusting PCM ring
  Rust shared library for single-producer/single-consumer PCM playout with
  persistent sample-rate conversion, clock recovery, and bounded concealment.

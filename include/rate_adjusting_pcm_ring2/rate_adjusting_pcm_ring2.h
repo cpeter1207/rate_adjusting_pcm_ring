@@ -46,13 +46,16 @@ enum rpcr2_result {
   RPCR2_ADAPTER_ERROR = -3,
 };
 
-/** @brief Persistent conversion quality supplied to the selected adapter. */
+/**
+ * @brief Stable selector; the adapter currently maps every value to
+ *        SRC_LINEAR.
+ */
 enum rpcr2_quality {
-  /** Highest quality offered by the selected adapter. */
+  /** Former highest-quality selector, retained for ABI compatibility. */
   RPCR2_QUALITY_BEST = 0,
-  /** Balanced quality and CPU use offered by the selected adapter. */
+  /** Former balanced selector, retained for ABI compatibility. */
   RPCR2_QUALITY_MEDIUM = 1,
-  /** Lowest-latency quality offered by the selected adapter. */
+  /** Former low-latency selector, retained for ABI compatibility. */
   RPCR2_QUALITY_FASTEST = 2,
 };
 

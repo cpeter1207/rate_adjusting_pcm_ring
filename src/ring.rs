@@ -34,14 +34,16 @@ const MINIMUM_RATIO: f64 = 1.0 / 256.0;
 /// Dynamic adapter's documented upper bound for a continuing conversion ratio.
 const MAXIMUM_RATIO: f64 = 256.0;
 
-/// One quality selection shared with the public C ABI.
+/// Stable selector values accepted by the public C ABI.
+///
+/// The required samplerate adapter currently maps every value to `SRC_LINEAR`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Quality {
-    /// Highest conversion quality offered by the selected adapter.
+    /// Former highest-quality selector, retained for ABI compatibility.
     Best,
-    /// Balanced quality and CPU use offered by the selected adapter.
+    /// Former balanced selector, retained for ABI compatibility.
     Medium,
-    /// Lowest-latency quality offered by the selected adapter.
+    /// Former low-latency selector, retained for ABI compatibility.
     Fastest,
 }
 
@@ -56,7 +58,7 @@ impl Quality {
         }
     }
 
-    /// Return the adapter-neutral conversion-quality value.
+    /// Return the stable selector value consumed by the samplerate adapter.
     const fn as_adapter(self) -> c_int {
         match self {
             Self::Best => 0,

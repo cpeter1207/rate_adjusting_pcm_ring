@@ -1,3 +1,9 @@
+rate-adjusting-pcm-ring (2.0.0~alpha4-1) unstable; urgency=medium
+
+  * Require the SRC_LINEAR samplerate adapter without changing ring ABI v2.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Fri, 25 Sep 2026 07:35:01 -0500
+
 rate-adjusting-pcm-ring (2.0.0~alpha3-1) unstable; urgency=medium
 
   * Preserve FIFO ordering across cursor wraps and silence failed resets.
