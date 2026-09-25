@@ -15,7 +15,9 @@ Reset discards pending PCM and concealment history even if the adapter reset
 fails. Rendering stays silent after a failed reset until a later reset succeeds.
 
 The library dynamically links `librptadv_samplerate_adapter.so.1`, the
-separately versioned project adapter. It does not ship a static archive.
+separately versioned project adapter. The ABI retains its best, medium, and
+fastest selector values, but the required adapter maps all three to
+`SRC_LINEAR`. It does not ship a static archive.
 
 ## Public ABI
 
@@ -35,8 +37,7 @@ consumers must convert boundary PCM to canonical F32 and use ABI major two.
 
 ## Build and verify
 
-Install a compatible `librptadv-samplerate-adapter-dev` package (currently
-`0.1.0~alpha1` or newer), then run:
+Install `librptadv-samplerate-adapter-dev` version `0.1.0~alpha3` or newer, then run:
 
 ```sh
 make
