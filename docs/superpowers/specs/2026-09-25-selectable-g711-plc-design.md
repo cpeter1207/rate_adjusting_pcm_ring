@@ -1,6 +1,6 @@
 # Selectable PCM loss concealment
 
-Status: written design for review; implementation has not started.
+Status: approved by the user on 2026-09-25; implementation has not started.
 
 ## Approved intent
 
