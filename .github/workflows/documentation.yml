@@ -1,0 +1,13 @@
+name: Publish documentation
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+jobs:
+  documentation:
+    uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/documentation.yml@main
+    with:
+      code_ref: ${{ github.sha }}

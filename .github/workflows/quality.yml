@@ -5,8 +5,10 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  pages: write
-  id-token: write
 jobs:
+  push-preflight:
+    if: github.event_name == 'push'
+    uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/preflight.yml@main
   quality:
+    if: github.event_name != 'push'
     uses: cpeter1207/rate_adjusting_pcm_ring_workflows/.github/workflows/quality.yml@main

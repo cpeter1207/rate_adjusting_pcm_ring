@@ -59,17 +59,28 @@ of the block API can otherwise retain their existing calls.
 ## Build and verify
 
 Debian build prerequisites are a C11 compiler, GNU Make, libsamplerate headers,
-Clang tools, Cppcheck, Doxygen, and Gcovr. Build and run the full local gate:
+Clang tools, Cppcheck, Doxygen, and Gcovr. Before an ordinary push, run the
+fast local checks:
+
+```sh
+make lint static-analysis
+```
+
+To run the full gate locally:
 
 ```sh
 make ci
 ```
 
-The gate builds static and shared libraries, runs unit and installed-consumer
-tests, verifies the unpacked source archive, requires zero diagnostics from
-formatting, Cppcheck, Clang-Tidy, and Doxygen, and enforces 100% line and
-branch coverage. GitHub runs the platform-dependent portion natively on
-Debian 12 and 13 for amd64 and arm64.
+GitHub repeats only the fast checks on pushes. A pull request must pass the
+full gate before it may merge: it builds static and shared libraries, runs unit
+and installed-consumer tests, verifies the unpacked source archive, requires
+zero diagnostics from formatting, Cppcheck, Clang-Tidy, and Doxygen, and
+enforces 100% line and branch coverage of production code on native Debian 13
+amd64. It also verifies the platform build, test, package, and staged install
+on native Debian 13 arm64. The release workflow performs its artifact-specific
+build and packaging checks without repeating that merge gate. API
+documentation is published after a validated change reaches `main`.
 
 ## Install
 
