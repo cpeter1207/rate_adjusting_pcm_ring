@@ -148,8 +148,15 @@ pub(crate) fn fail_allocation_at<T>(
 
 struct FakeConverter;
 
-unsafe extern "C" fn fake_create(quality: c_int, channels: u32, output: *mut *mut c_void) -> c_int {
-    if quality > 2 || channels != 1 || output.is_null() {
+unsafe extern "C" fn fake_create(
+    input_rate: u32,
+    output_rate: u32,
+    max_input: u32,
+    max_output: u32,
+    output: *mut *mut c_void,
+) -> c_int {
+    if input_rate == 0 || output_rate == 0 || max_input == 0 || max_output == 0 || output.is_null()
+    {
         return ERROR;
     }
     let converter = Box::new(FakeConverter);
@@ -194,6 +201,11 @@ unsafe extern "C" fn fake_process(
     OK
 }
 
+unsafe extern "C" fn fake_queued_input(_converter: *mut c_void, frames: *mut u32) -> c_int {
+    unsafe { *frames = 0 };
+    OK
+}
+
 unsafe extern "C" fn fake_destroy(converter: *mut c_void) {
     if !converter.is_null() {
         unsafe {
@@ -204,12 +216,14 @@ unsafe extern "C" fn fake_destroy(converter: *mut c_void) {
 
 pub(crate) static FAKE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 unsafe extern "C" fn failing_process(
@@ -263,7 +277,6 @@ unsafe extern "C" fn consume_one_zero_output_process(
 ) -> c_int {
     if converter.is_null()
         || input.is_null()
-        || input_frames == 0
         || output.is_null()
         || input_used.is_null()
         || output_generated.is_null()
@@ -273,7 +286,7 @@ unsafe extern "C" fn consume_one_zero_output_process(
         return ERROR;
     }
     unsafe {
-        *input_used = 1;
+        *input_used = input_frames.min(1);
         *output_generated = 0;
     }
     OK
@@ -281,55 +294,67 @@ unsafe extern "C" fn consume_one_zero_output_process(
 
 pub(crate) static FAILING_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(failing_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 pub(crate) static ZERO_PROGRESS_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(zero_progress_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static CONSUME_ONE_ZERO_OUTPUT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(consume_one_zero_output_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static WRONG_CAPABILITY_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: WRONG_CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 unsafe extern "C" fn create_fails(
-    _quality: c_int,
-    _channels: u32,
+    _input_rate: u32,
+    _output_rate: u32,
+    _max_input: u32,
+    _max_output: u32,
     _output: *mut *mut c_void,
 ) -> c_int {
     ERROR
 }
 
 unsafe extern "C" fn create_without_handle(
-    _quality: c_int,
-    _channels: u32,
+    _input_rate: u32,
+    _output_rate: u32,
+    _max_input: u32,
+    _max_output: u32,
     _output: *mut *mut c_void,
 ) -> c_int {
     OK
@@ -381,52 +406,62 @@ unsafe extern "C" fn invalid_output_count_process(
 
 pub(crate) static CREATE_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(create_fails),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static NULL_HANDLE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(create_without_handle),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static RESET_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(reset_fails),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static INVALID_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(invalid_count_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static INVALID_OUTPUT_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(invalid_output_count_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 pub(crate) fn adapter(descriptor: &AdapterDescriptor) -> AdapterFunctions {
@@ -666,6 +701,100 @@ fn actual_adapter_short_source_fifo_retains_full_output_pitch_history() {
 }
 
 #[test]
+fn actual_adapter_partitioning_preserves_loss_recovery_and_reset() {
+    let config = Settings {
+        capacity: 640,
+        input_rate_hz: 8000,
+        output_rate_hz: 48000,
+        reserve: 162,
+        target: 320,
+        max_producer: 160,
+        max_output: 960,
+        plc: PlcMode::G711AppendixI,
+    };
+    let a = Ring::create(config, load_functions().unwrap()).unwrap();
+    let b = Ring::create(config, load_functions().unwrap()).unwrap();
+    for block in 0..40 {
+        if block % 9 != 5 {
+            let input = core::array::from_fn::<_, 160, _>(|i| {
+                (((block * 160 + i) as f32) * 0.17).sin() * 0.5
+            });
+            assert_eq!(a.producer_push(&input), b.producer_push(&input));
+        }
+        let mut expected = [0.0; 960];
+        let (expected_real, expected_error) = a.consumer_render(&mut expected);
+        let mut actual = [0.0; 960];
+        let mut offset = 0;
+        let mut real = 0;
+        for count in [1, 7, 32, 128, 256, 536] {
+            let (produced, failed) = b.consumer_render(&mut actual[offset..offset + count]);
+            assert!(!failed);
+            real += produced;
+            offset += count;
+        }
+        assert!(!expected_error);
+        assert_eq!(real, expected_real);
+        assert_eq!(actual, expected);
+        assert_eq!(a.observe().missing_samples, b.observe().missing_samples);
+        assert_eq!(
+            a.observe().ratio_correction_ppm,
+            b.observe().ratio_correction_ppm
+        );
+        if block % 11 == 10 {
+            a.consumer_reset().unwrap();
+            b.consumer_reset().unwrap();
+        }
+    }
+}
+
+#[test]
+fn actual_adapter_reset_removes_all_previous_burst_pcm() {
+    let ring = Ring::create(settings(1024, 8000, 48000), load_functions().unwrap()).unwrap();
+    ring.producer_push(&[0.75; 512]);
+    let mut output = [0.0; 960];
+    assert_eq!(ring.consumer_render(&mut output), (960, false));
+    ring.consumer_reset().unwrap();
+    ring.producer_push(&[0.0; 512]);
+    assert_eq!(ring.consumer_render(&mut output), (960, false));
+    assert_eq!(output, [0.0; 960]);
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
+fn actual_adapter_reported_delay_aligns_the_impulse_peak() {
+    for (input_rate, output_rate) in [
+        (8000, 48000),
+        (48000, 8000),
+        (48000, 48000),
+        (44100, 48000),
+        (48000, 44100),
+    ] {
+        let ring = Ring::create(
+            settings(4096, input_rate, output_rate),
+            load_functions().unwrap(),
+        )
+        .unwrap();
+        let mut input = [0.0; 4096];
+        input[0] = 0.5;
+        assert_eq!(ring.producer_push(&input), 4096);
+        let mut output = [0.0; 2048];
+        let (_, failed) = ring.consumer_render(&mut output);
+        assert!(!failed);
+        let peak = output
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .unwrap()
+            .0;
+        assert!(
+            peak.abs_diff(ring.output_delay_samples() as usize) <= 1,
+            "{input_rate}->{output_rate}: peak={peak}, delay={}",
+            ring.output_delay_samples()
+        );
+    }
+}
+
+#[test]
 fn callback_partitioning_does_not_change_priming_plc_or_recovery() {
     let config = Settings {
         reserve: 40,
@@ -696,6 +825,61 @@ fn callback_partitioning_does_not_change_priming_plc_or_recovery() {
         }
     }
     assert_eq!(a.observe().missing_samples, b.observe().missing_samples);
+}
+
+#[test]
+fn rendering_drains_adapter_pcm_after_the_source_fifo_is_empty() {
+    unsafe extern "C" fn create(
+        _input_rate: u32,
+        _output_rate: u32,
+        _max_input: u32,
+        _max_output: u32,
+        output: *mut *mut c_void,
+    ) -> c_int {
+        unsafe { *output = Box::into_raw(Box::new(0_u32)).cast() };
+        OK
+    }
+    unsafe extern "C" fn destroy(handle: *mut c_void) {
+        unsafe { drop(Box::from_raw(handle.cast::<u32>())) };
+    }
+    unsafe extern "C" fn process(
+        handle: *mut c_void,
+        _input: *const f32,
+        input_frames: u32,
+        output: *mut f32,
+        output_capacity: u32,
+        _ratio: f64,
+        used: *mut u32,
+        generated: *mut u32,
+    ) -> c_int {
+        let pending = unsafe { &mut *handle.cast::<u32>() };
+        *pending += input_frames;
+        let count = if input_frames == 0 {
+            *pending
+        } else {
+            *pending / 2
+        }
+        .min(output_capacity);
+        unsafe {
+            core::slice::from_raw_parts_mut(output, count as usize).fill(0.25);
+            *used = input_frames;
+            *generated = count;
+        }
+        *pending -= count;
+        OK
+    }
+    let descriptor = AdapterDescriptor {
+        converter_create: Some(create),
+        converter_process: Some(process),
+        converter_destroy: Some(destroy),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    assert_eq!(ring.producer_push(&[0.25; 128]), 128);
+    let mut output = [0.0; 128];
+    assert_eq!(ring.consumer_render(&mut output), (128, false));
+    assert_eq!(output, [0.25; 128]);
+    assert_eq!(ring.observe().missing_samples, 0);
 }
 
 #[test]
@@ -910,86 +1094,245 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
 
     let undersized = AdapterDescriptor {
         struct_size: 0,
-        abi_version: 1,
-        capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
-        converter_create: Some(fake_create),
-        converter_reset: Some(fake_reset),
-        converter_process: Some(fake_process),
-        converter_destroy: Some(fake_destroy),
-    };
-    assert!(unsafe { AdapterFunctions::from_descriptor(&undersized) }.is_err());
-
-    let incompatible_abi = AdapterDescriptor {
-        struct_size: size_of::<AdapterDescriptor>() as u32,
         abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&undersized) }.is_err());
+
+    let incompatible_abi = AdapterDescriptor {
+        struct_size: size_of::<AdapterDescriptor>() as u32,
+        abi_version: 1,
+        capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
+        converter_create: Some(fake_create),
+        converter_reset: Some(fake_reset),
+        converter_process: Some(fake_process),
+        converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&incompatible_abi) }.is_err());
 
     let missing_capability = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: ptr::null(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_capability) }.is_err());
 
     let missing_create = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: None,
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_create) }.is_err());
 
     let missing_reset = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: None,
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_reset) }.is_err());
 
     let missing_process = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: None,
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_process) }.is_err());
 
     let missing_destroy = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: None,
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_destroy) }.is_err());
+
+    let missing_queue = AdapterDescriptor {
+        converter_queued_input: None,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&missing_queue) }.is_err());
+    let missing_delay = AdapterDescriptor {
+        converter_output_delay: None,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&missing_delay) }.is_err());
+}
+
+#[test]
+fn adapter_binding_accepts_the_nominal_rate_abi() {
+    let descriptor = AdapterDescriptor {
+        abi_version: 2,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&descriptor) }.is_ok());
+}
+
+#[test]
+fn descriptor_exposes_intrinsic_output_delay_for_finite_media() {
+    assert!(descriptor().struct_size >= 88);
+    unsafe extern "C" fn delay(_handle: *mut c_void, frames: *mut u32) -> c_int {
+        unsafe { *frames = 77 };
+        OK
+    }
+    let handle = handle_with(adapter(&AdapterDescriptor {
+        converter_output_delay: Some(delay),
+        ..FAKE_DESCRIPTOR
+    }));
+    let mut samples = 123;
+    let query = descriptor().ring_output_delay;
+    assert_eq!(query(ptr::null(), &mut samples), RESULT_INVALID_ARGUMENT);
+    assert_eq!(samples, 123);
+    assert_eq!(
+        query(handle.as_ptr(), ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(query(handle.as_ptr(), &mut samples), RESULT_OK);
+    assert_eq!(samples, 77);
+    assert_eq!(
+        (descriptor().ring_consumer_reset)(handle.as_ptr()),
+        RESULT_OK
+    );
+    assert_eq!(query(handle.as_ptr(), &mut samples), RESULT_OK);
+    assert_eq!(samples, 77);
+}
+
+#[test]
+fn output_delay_failure_rejects_ring_creation() {
+    unsafe extern "C" fn delay(_handle: *mut c_void, _frames: *mut u32) -> c_int {
+        ERROR
+    }
+    assert!(matches!(
+        Ring::create(
+            settings(512, 8000, 8000),
+            adapter(&AdapterDescriptor {
+                converter_output_delay: Some(delay),
+                ..FAKE_DESCRIPTOR
+            })
+        ),
+        Err(CreateError::Adapter)
+    ));
+}
+
+#[test]
+fn controller_counts_adapter_backlog_in_input_samples() {
+    unsafe extern "C" fn queued(_handle: *mut c_void, frames: *mut u32) -> c_int {
+        unsafe { *frames = 128 };
+        OK
+    }
+    let descriptor = AdapterDescriptor {
+        converter_queued_input: Some(queued),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    ring.producer_push(&[0.25]);
+    assert_eq!(ring.consumer_render_sample(), (0.25, true, false));
+    assert_eq!(ring.observe().filtered_occupancy_samples, 129);
+    assert_eq!(ring.observe().available_samples, 0);
+}
+
+#[test]
+fn empty_playout_does_not_accelerate_the_clock_controller() {
+    let ring = Ring::create(
+        Settings {
+            target: 128,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    let mut output = [0.0; 256];
+    ring.producer_push(&[0.25; 512]);
+    ring.consumer_render(&mut output);
+    ring.consumer_render(&mut output);
+    let before = ring.observe();
+    for _ in 0..20 {
+        assert_eq!(ring.consumer_render(&mut output), (0, false));
+    }
+    let after = ring.observe();
+    assert_eq!(after.ratio_correction_ppm, before.ratio_correction_ppm);
+    assert_eq!(
+        after.filtered_occupancy_samples,
+        before.filtered_occupancy_samples
+    );
+}
+
+#[test]
+fn adapter_queue_failure_is_reported_as_a_converter_fault() {
+    unsafe extern "C" fn queued(_handle: *mut c_void, _frames: *mut u32) -> c_int {
+        ERROR
+    }
+    let descriptor = AdapterDescriptor {
+        converter_queued_input: Some(queued),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    ring.producer_push(&[0.25]);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.observe().adapter_error_count, 1);
+}
+
+#[test]
+fn ring_supplies_nominal_rates_and_internal_workspace_bounds() {
+    unsafe extern "C" fn create(
+        input_rate: u32,
+        output_rate: u32,
+        max_input: u32,
+        max_output: u32,
+        handle: *mut *mut c_void,
+    ) -> c_int {
+        if (input_rate, output_rate, max_input, max_output) != (8000, 48000, 640, 256) {
+            return ERROR;
+        }
+        unsafe { fake_create(input_rate, output_rate, max_input, max_output, handle) }
+    }
+    let descriptor = AdapterDescriptor {
+        converter_create: Some(create),
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(Ring::create(settings(640, 8000, 48000), adapter(&descriptor)).is_ok());
 }
 
 #[test]
 fn adapter_converter_lifecycle_validates_callback_results() {
     let mut converter = adapter(&FAKE_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("fake converter creation");
     let mut output = [0.0; 2];
     assert_eq!(
@@ -998,33 +1341,33 @@ fn adapter_converter_lifecycle_validates_callback_results() {
     );
     assert_eq!(output, [0.1, -0.2]);
     assert!(converter.reset().is_ok());
-    assert!(converter.process(&[], &mut output, 1.0).is_err());
+    assert_eq!(converter.process(&[], &mut output, 1.0), Ok((0, 0)));
     assert!(converter.process(&[0.1], &mut [], 1.0).is_err());
     assert!(converter.process(&[0.1], &mut output, 0.0).is_err());
     assert!(converter.process(&[0.1], &mut output, f64::NAN).is_err());
     assert!(
         adapter(&CREATE_FAILURE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
     assert!(
         adapter(&NULL_HANDLE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
     assert!(
         adapter(&RESET_FAILURE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
 
     let mut invalid_counts = adapter(&INVALID_COUNT_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("invalid-count converter creation");
     assert!(invalid_counts.process(&[0.1], &mut output, 1.0).is_err());
 
     let mut invalid_output_counts = adapter(&INVALID_OUTPUT_COUNT_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("invalid-output-count converter creation");
     assert!(
         invalid_output_counts
@@ -1037,7 +1380,7 @@ fn adapter_converter_lifecycle_validates_callback_results() {
 fn dynamic_adapter_descriptor_is_usable_at_ring_construction_time() {
     let functions = load_functions().expect("installed dynamic adapter descriptor");
     let mut converter = functions
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("installed dynamic converter creation");
     let input = [0.1; 512];
     let mut output = [0.0; 512];

@@ -91,6 +91,8 @@ type ConsumerRender = extern "C" fn(*mut Rpcr3Ring, *mut f32, u64, *mut u64) -> 
 type ConsumerReset = extern "C" fn(*mut Rpcr3Ring) -> c_int;
 /// C function type that copies a diagnostic snapshot.
 type Observe = extern "C" fn(*const Rpcr3Ring, *mut CObservation) -> c_int;
+/// C function type reporting the immutable intrinsic output delay.
+type OutputDelay = extern "C" fn(*const Rpcr3Ring, *mut u64) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -106,6 +108,7 @@ pub struct Descriptor {
     ring_consumer_render: ConsumerRender,
     ring_consumer_reset: ConsumerReset,
     ring_observe: Observe,
+    ring_output_delay: OutputDelay,
 }
 
 // The descriptor contains immutable data and function pointers valid for the
@@ -401,7 +404,19 @@ extern "C" fn ring_observe(ring: *const Rpcr3Ring, observation: *mut CObservatio
     RESULT_OK
 }
 
-/// Process-lifetime immutable public function table.
+/// Report the immutable FIR delay without accessing mutable consumer state.
+extern "C" fn ring_output_delay(ring: *const Rpcr3Ring, samples: *mut u64) -> c_int {
+    let Ok(handle) = (unsafe { checked_ring(ring.cast_mut()) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let Some(samples) = (unsafe { samples.as_mut() }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    *samples = handle.ring.output_delay_samples();
+    RESULT_OK
+}
+
+/// The process-lifetime ABI descriptor, including compatible tail extensions.
 static DESCRIPTOR: Descriptor = Descriptor {
     struct_size: size_of::<Descriptor>() as u32,
     abi_version: ABI_VERSION,
@@ -414,6 +429,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_consumer_render,
     ring_consumer_reset,
     ring_observe,
+    ring_output_delay,
 };
 
 /// Return the immutable ABI-major-3 descriptor for the Rust ring.

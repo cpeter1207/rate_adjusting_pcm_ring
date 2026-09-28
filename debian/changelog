@@ -1,3 +1,11 @@
+rate-adjusting-pcm-ring (3.0.0~alpha2-1) unstable; urgency=medium
+
+  * Keep ring ABI 3 and use samplerate adapter ABI 2 with libswresample.
+  * Drain adapter PCM and include queued input in clock-recovery occupancy.
+  * Append an ABI-compatible intrinsic-delay query for finite-media trimming.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Mon, 28 Sep 2026 00:00:00 -0500
+
 rate-adjusting-pcm-ring (3.0.0~alpha1-1) unstable; urgency=medium
 
   * Introduce ABI 3 with immutable timing and callback bounds, selectable

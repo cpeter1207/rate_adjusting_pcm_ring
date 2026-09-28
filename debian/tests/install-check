@@ -8,7 +8,7 @@ pkg-config --exists rate_adjusting_pcm_ring3
 library_dir=$(pkg-config --variable=libdir rate_adjusting_pcm_ring3)
 library="$library_dir/librate_adjusting_pcm_ring3.so.3"
 readelf -d "$library" | grep -F 'librate_adjusting_pcm_ring3.so.3'
-readelf -d "$library" | grep -F 'librptadv_samplerate_adapter.so.1'
+readelf -d "$library" | grep -F 'librptadv_samplerate_adapter.so.2'
 if readelf -d "$library" | grep -F 'libsamplerate.so'; then
     exit 1
 fi

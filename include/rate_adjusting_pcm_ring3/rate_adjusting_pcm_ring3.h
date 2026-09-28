@@ -49,7 +49,7 @@ enum rpcr3_result {
 
 /** @brief Immutable missing-output policy. */
 enum rpcr3_plc_mode {
-  /** Emit silence on shortfall with no PLC history or algorithmic delay. */
+  /** Emit silence on shortfall with no PLC history or added PLC delay. */
   RPCR3_PLC_DISABLED = 0,
   /** Use G.711 Appendix I at the output rate with 3.75 ms lookahead. */
   RPCR3_PLC_G711_APPENDIX_I = 1,
@@ -71,8 +71,10 @@ _Static_assert(sizeof(enum rpcr3_plc_mode) == sizeof(int32_t),
  * @brief Immutable ring setup supplied before either endpoint starts.
  *
  * All fields remain fixed for the ring lifetime. Prepare a new ring to change
- * rates, timing, block bounds or concealment. Conversion always uses the
- * required dynamic adapter's SRC_LINEAR implementation.
+ * rates, timing, block bounds or concealment. Conversion uses dynamic adapter
+ * ABI 2: libswresample with filter_size=256, cutoff=0.985 and a Kaiser filter.
+ * Its fixed FIR delay is separate from the configured reserve and PLC delay;
+ * it is approximately 16 ms for 8 kHz input converted to 48 kHz output.
  *
  * Rates must be nonzero with output/input ratio from 1/256 through 256.
  * Both block maxima must be nonzero; reserve and target must not exceed
@@ -126,7 +128,8 @@ struct rpcr3_observation {
   uint64_t available_samples;
   /** Immutable input-sample playout priming reserve. */
   uint64_t reserve_samples;
-  /** Low-pass filtered input occupancy used by the rate controller. */
+  /** Low-pass filtered input occupancy, including adapter backlog but
+   * excluding its fixed FIR delay, used by the rate controller. */
   uint64_t filtered_occupancy_samples;
   /** Immutable input-sample occupancy target. */
   uint64_t target_samples;
@@ -251,6 +254,19 @@ struct rpcr3_descriptor {
    */
   enum rpcr3_result (*ring_observe)(const struct rpcr3_ring *ring,
                                     struct rpcr3_observation *observation);
+  /**
+   * @brief Report fixed FIR delay in output samples, excluding PLC lookahead.
+   * @param ring Live ring whose immutable conversion settings are queried.
+   * @param samples Destination for the delay; unchanged on invalid arguments.
+   * @return One @ref rpcr3_result value.
+   *
+   * Compatible descriptor extension introduced in 3.0.0-alpha.2. Validate
+   * struct_size before accessing this callback. Finite-media consumers may
+   * discard this prefix and supply enough trailing padding to retain the
+   * source duration. The query performs no allocation or consumer-state access.
+   */
+  enum rpcr3_result (*ring_output_delay)(const struct rpcr3_ring *ring,
+                                         uint64_t *samples);
 };
 
 /**

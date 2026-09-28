@@ -101,7 +101,7 @@ static void callers(void) {
   exercise_policy(c); /* Offline media, no replacement output. */
 }
 
-/** Both signs of 100 ppm drift remain within the declared app_rpt geometry. */
+/** Both drift directions remain within the declared app_rpt geometry. */
 static void drift(int ppm) {
   struct rpcr3_config c = {.struct_size = sizeof(c),
                            .abi_version = RPCR3_ABI_VERSION,
@@ -117,7 +117,7 @@ static void drift(int ppm) {
   assert(api->ring_create(&c, &ring) == RPCR3_OK);
   supply(ring, 320, 160);
   uint64_t accumulated = 0;
-  for (unsigned block = 0; block < 3000; ++block) {
+  for (unsigned block = 0; block < 9000; ++block) {
     float output[960];
     uint64_t real = 0;
     assert(api->ring_consumer_render(ring, output, 960, &real) == RPCR3_OK);
@@ -130,6 +130,9 @@ static void drift(int ppm) {
   assert(result.adapter_error_count == 0);
   assert(result.ratio_correction_ppm >= -1000 &&
          result.ratio_correction_ppm <= 1000);
+  assert((int64_t)result.ratio_correction_ppm * ppm < 0);
+  assert(result.filtered_occupancy_samples > 128 &&
+         result.filtered_occupancy_samples < c.capacity_samples);
   api->ring_destroy(ring);
 }
 
@@ -139,6 +142,8 @@ int main(void) {
   callers();
   drift(-100);
   drift(100);
-  puts("PLC callers and +/-100 ppm drift: passed");
+  drift(-500);
+  drift(500);
+  puts("PLC callers and +/-100/500 ppm drift: passed");
   return 0;
 }

@@ -22,7 +22,7 @@ CPPHECK_EXHAUSTIVE := $(shell $(CPPCHECK) --help 2>&1 | grep -q -- '--check-leve
 
 PACKAGE := rate-adjusting-pcm-ring
 CRATE := rate_adjusting_pcm_ring3
-PACKAGE_VERSION ?= 3.0.0-alpha.1
+PACKAGE_VERSION ?= 3.0.0-alpha.2
 SOVERSION := 3
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -176,7 +176,7 @@ install-check: all
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
 		grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
-		grep -F 'librptadv_samplerate_adapter.so.1'
+		grep -F 'librptadv_samplerate_adapter.so.2'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libsamplerate.so'
 	$(READELF) --dyn-syms --wide build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
 		grep -E '[[:space:]]rpcr3_descriptor$$'
@@ -196,7 +196,7 @@ install-check: all
 adapter-debs:
 	test -n "$(SAMPLERATE_ADAPTER_DEB_DIR)"
 	test -d "$(SAMPLERATE_ADAPTER_DEB_DIR)"
-	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb' | wc -l)" -eq 1
+	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb' | wc -l)" -eq 1
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb' | wc -l)" -eq 1
 
 debian-package-check: dist adapter-debs
@@ -221,7 +221,7 @@ debian-package-check: dist adapter-debs
 	test -f "$(DEBIAN_DEV_DEB)"
 	rm -rf $(DEBIAN_STAGE)
 	mkdir -p $(DEBIAN_STAGE)
-	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb')" $(DEBIAN_STAGE)
+	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb')" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb')" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$(DEBIAN_RUNTIME_DEB)" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$(DEBIAN_DEV_DEB)" $(DEBIAN_STAGE)
@@ -235,9 +235,9 @@ debian-package-check: dist adapter-debs
 	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig/rate_adjusting_pcm_ring2.pc"
 	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).a"
 	test -L "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so"
-	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librptadv_samplerate_adapter.so.1"
+	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librptadv_samplerate_adapter.so.2"
 	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
-		grep -F 'librptadv_samplerate_adapter.so.1'
+		grep -F 'librptadv_samplerate_adapter.so.2'
 	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -F 'libsamplerate.so'
 	$(READELF) --dyn-syms --wide "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
 		grep -E '[[:space:]]rpcr3_descriptor$$'
@@ -267,7 +267,7 @@ autopkgtest: debian-package-check adapter-debs
 	cleanup; \
 	trap 'status=$$?; cleanup; exit $$status' EXIT; \
 	$(AUTOPKGTEST) -U --output-dir $(AUTOPKGTEST_DIR) \
-		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb') \
+		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb') \
 		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb') \
 		$(DEBIAN_RUNTIME_DEB) $(DEBIAN_DEV_DEB) . -- \
 		docker --no-init $(AUTOPKGTEST_TESTBED_IMAGE) \
@@ -309,7 +309,7 @@ ci: quality platform-verify
 quality-image:
 	test -n "$(SAMPLERATE_ADAPTER_DEB_DIR)"
 	test -d "$(SAMPLERATE_ADAPTER_DEB_DIR)"
-	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb' | wc -l)" -eq 1
+	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb' | wc -l)" -eq 1
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb' | wc -l)" -eq 1
 	docker image pull $(QUALITY_BASE_IMAGE)
 	test "$(AUTOPKGTEST_TESTBED_IMAGE)" = "$(QUALITY_BASE_IMAGE)" || \

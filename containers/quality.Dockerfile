@@ -16,12 +16,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 		autopkgtest ca-certificates cargo curl debhelper docker-cli dpkg-dev iproute2 pkg-config rustc && \
 	rm -rf /var/lib/apt/lists/*
 
-COPY --from=samplerate_adapter_debs librptadv-samplerate-adapter1_*.deb /tmp/rptadv-samplerate-adapter/
+COPY --from=samplerate_adapter_debs librptadv-samplerate-adapter2_*.deb /tmp/rptadv-samplerate-adapter/
 COPY --from=samplerate_adapter_debs librptadv-samplerate-adapter-dev_*.deb /tmp/rptadv-samplerate-adapter/
 
-RUN dpkg -i /tmp/rptadv-samplerate-adapter/librptadv-samplerate-adapter1_*.deb \
+RUN dpkg -i /tmp/rptadv-samplerate-adapter/librptadv-samplerate-adapter2_*.deb \
 		/tmp/rptadv-samplerate-adapter/librptadv-samplerate-adapter-dev_*.deb && \
-	pkg-config --atleast-version=0.1.0~alpha3 rptadv_samplerate_adapter && \
+	pkg-config --atleast-version=0.2.0~alpha1 rptadv_samplerate_adapter && \
 	rm -rf /tmp/rptadv-samplerate-adapter
 
 RUN case "${TARGETARCH}" in \

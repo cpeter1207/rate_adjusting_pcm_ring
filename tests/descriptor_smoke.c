@@ -49,6 +49,7 @@ int main(void) {
   assert(descriptor->ring_consumer_render != NULL);
   assert(descriptor->ring_consumer_reset != NULL);
   assert(descriptor->ring_observe != NULL);
+  assert(descriptor->ring_output_delay != NULL);
   assert(descriptor->ring_create(&config, NULL) == RPCR3_INVALID_ARGUMENT);
   assert(descriptor->ring_create(NULL, &ring) == RPCR3_INVALID_ARGUMENT);
   assert(ring == NULL);
@@ -65,6 +66,9 @@ int main(void) {
     config.plc_mode = mode;
     assert(descriptor->ring_create(&config, &ring) == RPCR3_OK);
     assert(ring != NULL);
+    uint64_t output_delay = 0;
+    assert(descriptor->ring_output_delay(ring, &output_delay) == RPCR3_OK);
+    assert(output_delay > 0);
     struct rpcr3_ring *original = ring;
     invalid.abi_version = 2;
     assert(descriptor->ring_create(&invalid, &ring) == RPCR3_INVALID_ARGUMENT);

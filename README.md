@@ -1,43 +1,59 @@
 # rate-adjusting-pcm-ring
 
 `rate-adjusting-pcm-ring` is the shared lock-free single-producer,
-single-consumer playout ring for the rpt_advanced project. ABI major two is a
+single-consumer playout ring for the rpt_advanced project. ABI major three is a
 Rust dynamic shared object with an opaque C handle and canonical mono F32 PCM
 in the normalized range `-1.0` through `+1.0`.
 
 The producer never waits or overwrites unread PCM. The consumer owns one
 persistent dynamic sample-rate adapter. Block rendering waits for the requested
 reserve before new-burst playout. The occupancy target controls slow clock-drift
-correction. Brief output shortfalls use bounded pitch-period continuation
-with equal-power entry and recovery transitions; sustained loss fades out.
+correction. Concealment is selected at construction: disabled mode emits
+silence on loss; G.711 Appendix I mode uses output-rate pitch history, adds
+3.75 ms lookahead, and fades sustained loss to silence by 60 ms.
 
 Reset discards pending PCM and concealment history even if the adapter reset
 fails. Rendering stays silent after a failed reset until a later reset succeeds.
 
-The library dynamically links `librptadv_samplerate_adapter.so.1`, the
-separately versioned project adapter. The ABI retains its best, medium, and
-fastest selector values, but the required adapter maps all three to
-`SRC_LINEAR`. It does not ship a static archive.
+The library dynamically links `librptadv_samplerate_adapter.so.2`, the
+separately versioned project adapter. It uses libswresample with
+`filter_size=256`, `cutoff=0.985`, and a Kaiser filter. The adapter implements
+the ring's slow clock correction with `swr_set_compensation`. There is no
+quality selector or static archive.
+
+The FIR filter has its own fixed delay, approximately 16 ms for 8 kHz input
+converted to 48 kHz output. This is separate from the configured priming
+reserve and optional PLC lookahead. Construction and burst reset prepare zero
+filter history; startup filter response is not counted as packet loss.
+The controller includes input queued inside the adapter, excluding fixed
+filter delay, so adapter buffering does not consume the configured jitter
+headroom. The public `available_samples` observation remains the unread FIFO
+count. Empty-input calls drain available converted PCM without an end-of-stream
+flush; continuous playout and recovery keep the filter state. Finite-media
+callers use `ring_output_delay` to discard the intrinsic output prefix and
+provide trailing padding before retaining exactly the source duration. This
+read-only callback is appended compatibly to the ABI-3 descriptor in
+3.0.0-alpha.2; callers must validate its `struct_size` before using it.
 
 ## Public ABI
 
-ABI major two is the canonical-F32 interface:
+ABI major three is the canonical-F32 interface:
 
-- runtime library: `librate_adjusting_pcm_ring2.so.2`
-- runtime package: `librate-adjusting-pcm-ring2`
-- development package: `librate-adjusting-pcm-ring2-dev`
+- runtime library: `librate_adjusting_pcm_ring3.so.3`
+- runtime package: `librate-adjusting-pcm-ring3`
+- development package: `librate-adjusting-pcm-ring3-dev`
 - public header:
-  [`include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h`](include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h)
-- pkg-config module: `rate_adjusting_pcm_ring2`
+  [`include/rate_adjusting_pcm_ring3/rate_adjusting_pcm_ring3.h`](include/rate_adjusting_pcm_ring3/rate_adjusting_pcm_ring3.h)
+- pkg-config module: `rate_adjusting_pcm_ring3`
 
 The descriptor owns lifecycle, rendering, observations, and error translation.
-Consumers dynamically link the released ABI-2 package and use its opaque
-handle. The former S16 ABI-major-one facade and its packages are not shipped;
-consumers must convert boundary PCM to canonical F32 and use ABI major two.
+Consumers dynamically link the released ABI-3 package and use its opaque
+handle. This resampler migration preserves the existing public descriptor
+prefix and configuration layout. Consumers must convert boundary PCM to canonical F32.
 
 ## Build and verify
 
-Install `librptadv-samplerate-adapter-dev` version `0.1.0~alpha3` or newer, then run:
+Install `librptadv-samplerate-adapter-dev` version `0.2.0~alpha1` or newer, then run:
 
 ```sh
 make

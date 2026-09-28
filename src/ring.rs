@@ -199,6 +199,7 @@ pub(crate) struct Ring {
     adapter_error_count: AtomicU64,
     input_rate_hz: u32,
     output_rate_hz: u32,
+    output_delay_samples: u64,
     max_producer: usize,
     max_output: usize,
     consumer: UnsafeCell<ConsumerState>,
@@ -238,7 +239,12 @@ impl Ring {
             Ok(workspaces) => workspaces,
             Err(()) => return Err(CreateError::NoMemory),
         };
-        let converter = match adapter.create_converter(0) {
+        let converter = match adapter.create_converter(
+            input_rate_hz,
+            output_rate_hz,
+            capacity as u32,
+            CONVERTER_QUANTUM as u32,
+        ) {
             Ok(converter) => converter,
             Err(()) => return Err(CreateError::Adapter),
         };
@@ -259,6 +265,7 @@ impl Ring {
             adapter_error_count: AtomicU64::new(0),
             input_rate_hz,
             output_rate_hz,
+            output_delay_samples: u64::from(converter.output_delay_samples),
             max_producer: settings.max_producer as usize,
             max_output: settings.max_output as usize,
             consumer: UnsafeCell::new(ConsumerState {
@@ -339,6 +346,11 @@ impl Ring {
     /// Maximum accepted consumer call size, in output samples.
     pub(crate) fn max_output_samples(&self) -> usize {
         self.max_output
+    }
+
+    /// Immutable FIR delay in output samples, excluding optional PLC lookahead.
+    pub(crate) fn output_delay_samples(&self) -> u64 {
+        self.output_delay_samples
     }
 
     /// Render one output sample using the same priming policy as block playout.
@@ -508,44 +520,51 @@ impl ConsumerState {
             self.input[self.input_offset + self.input_pending] = sample;
             self.input_pending += 1;
         }
-        if self.input_pending == 0 {
+        if self.input_pending == 0 && self.zero_progress {
             return RefillResult::Starved;
         }
-
+        let Ok(queued_input) = self.converter.queued_input() else {
+            return RefillResult::AdapterError;
+        };
         let occupancy = ring
             .available()
             .saturating_add(self.input_pending as u64)
+            .saturating_add(u64::from(queued_input))
             .saturating_mul(1000);
-        if self.occupancy_milli == 0 {
-            self.occupancy_milli = occupancy;
-        } else {
-            let difference = occupancy as i64 - self.occupancy_milli as i64;
-            self.occupancy_milli = (self.occupancy_milli as i64 + difference / 128) as u64;
-        }
-        ring.filtered_occupancy_milli
-            .store(self.occupancy_milli, Ordering::Relaxed);
+        if occupancy != 0 {
+            if self.occupancy_milli == 0 {
+                self.occupancy_milli = occupancy;
+            } else {
+                let difference = occupancy as i64 - self.occupancy_milli as i64;
+                self.occupancy_milli = (self.occupancy_milli as i64 + difference / 128) as u64;
+            }
+            ring.filtered_occupancy_milli
+                .store(self.occupancy_milli, Ordering::Relaxed);
 
-        let output_rate_hz = ring.output_rate_hz;
-        let input_rate_hz = ring.input_rate_hz;
-        let nominal = f64::from(output_rate_hz) / f64::from(input_rate_hz);
-        let error = if target_samples == 0 {
-            0.0
-        } else {
-            ((self.occupancy_milli as f64 - target_samples as f64 * 1000.0)
-                / (target_samples as f64 * 1000.0))
-                .clamp(-1.0, 1.0)
-        };
-        let desired = (nominal * (1.0 - error * 0.001)).clamp(MINIMUM_RATIO, MAXIMUM_RATIO);
-        self.ratio = if self.ratio == 0.0 {
-            nominal
-        } else {
-            self.ratio + (desired - self.ratio) / 512.0
+            let output_rate_hz = ring.output_rate_hz;
+            let input_rate_hz = ring.input_rate_hz;
+            let nominal = f64::from(output_rate_hz) / f64::from(input_rate_hz);
+            let error = if target_samples == 0 {
+                0.0
+            } else {
+                ((self.occupancy_milli as f64 - target_samples as f64 * 1000.0)
+                    / (target_samples as f64 * 1000.0))
+                    .clamp(-1.0, 1.0)
+            };
+            let desired = (nominal * (1.0 - error * 0.001)).clamp(MINIMUM_RATIO, MAXIMUM_RATIO);
+            self.ratio = if self.ratio == 0.0 {
+                nominal
+            } else {
+                self.ratio + (desired - self.ratio) / 512.0
+            }
+            .clamp(MINIMUM_RATIO, MAXIMUM_RATIO);
+            let ppm = ((self.ratio / nominal - 1.0) * 1_000_000.0)
+                .round()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            ring.ratio_correction_ppm.store(ppm, Ordering::Relaxed);
+        } else if self.ratio == 0.0 {
+            self.ratio = f64::from(ring.output_rate_hz) / f64::from(ring.input_rate_hz);
         }
-        .clamp(MINIMUM_RATIO, MAXIMUM_RATIO);
-        let ppm = ((self.ratio / nominal - 1.0) * 1_000_000.0)
-            .round()
-            .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-        ring.ratio_correction_ppm.store(ppm, Ordering::Relaxed);
 
         let input = &self.input[self.input_offset..self.input_offset + self.input_pending];
         let output = &mut self.output[..quantum];

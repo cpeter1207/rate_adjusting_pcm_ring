@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "rate-adjusting-pcm-ring3"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.2"
