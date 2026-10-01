@@ -17,7 +17,7 @@ fails. Rendering stays silent after a failed reset until a later reset succeeds.
 
 The library dynamically links `librptadv_samplerate_adapter.so.2`, the
 separately versioned project adapter. It uses libswresample with
-`filter_size=64`, `cutoff=0.985`, and a Kaiser filter. The adapter implements
+`filter_size=32`, `cutoff=0.985`, and a Kaiser filter. The adapter implements
 the ring's slow clock correction with `swr_set_compensation`. There is no
 quality selector or static archive.
 
