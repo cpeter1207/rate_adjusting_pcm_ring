@@ -72,9 +72,9 @@ _Static_assert(sizeof(enum rpcr3_plc_mode) == sizeof(int32_t),
  *
  * All fields remain fixed for the ring lifetime. Prepare a new ring to change
  * rates, timing, block bounds or concealment. Conversion uses dynamic adapter
- * ABI 2: libswresample with filter_size=32, cutoff=0.985 and a Kaiser filter.
+ * ABI 2: libswresample with filter_size=16, cutoff=1.0 and a Kaiser filter.
  * Its fixed FIR delay is separate from the configured reserve and PLC delay;
- * it is approximately 16 ms for 8 kHz input converted to 48 kHz output.
+ * it is approximately 1 ms for 8 kHz input converted to 48 kHz output.
  *
  * Rates must be nonzero with output/input ratio from 1/256 through 256.
  * Both block maxima must be nonzero; reserve and target must not exceed
