@@ -1,19 +1,69 @@
 //! Unit coverage for the Rust ring using a deterministic in-process SRC fake.
 
+use crate::ring::{PlcMode, Settings};
 use core::ffi::{CStr, c_char, c_int, c_void};
+
+#[test]
+fn immutable_policy_rejects_insufficient_callback_or_burst_headroom() {
+    for (fi, fo, p, n, r, t, c, enabled, valid) in [
+        (8000, 48000, 160, 960, 162, 320, 640, true, true),
+        (8000, 48000, 160, 960, 161, 320, 640, true, false),
+        (8000, 48000, 320, 960, 162, 320, 640, true, true),
+        (8000, 48000, 320, 960, 162, 320, 639, true, false),
+        (8000, 48000, 4096, 4096, 685, 2080, 6176, true, true),
+        (8000, 48000, 4096, 4096, 685, 2080, 6175, true, false),
+        (48000, 48000, 4096, 4096, 4102, 12480, 16576, true, true),
+        (48000, 48000, 4096, 4096, 0, 0, 14400, false, true),
+        (48000, 48000, 4096, 4096, 7200, 7200, 14400, false, true),
+        (48000, 48000, 4096, 4096, 7200, 0, 14400, false, true),
+        (48000, 48000, 1, 1, 0, 0, 512, true, false),
+        (48000, 48000, 0, 1, 100, 100, 512, true, false),
+        (48000, 48000, 1, 0, 100, 100, 512, true, false),
+        (0, 48000, 1, 1, 0, 0, 512, false, false),
+        (48000, 0, 1, 1, 0, 0, 512, false, false),
+        (1, 257, 1, 1, 0, 0, 512, false, false),
+        (257, 1, 1, 1, 0, 0, 512, false, false),
+        (256, 1, 1, 1, 0, 0, 512, false, true),
+        (1, 256, 1, 1, 0, 0, 512, false, true),
+        (48000, 48000, 1, 1, 513, 0, 512, false, false),
+        (48000, 48000, 1, 1, 0, 513, 512, false, false),
+        (48000, 48000, 1, 1, 0, 0, 511, false, false),
+        (48000, 48000, 1, 1, 100, 99, 512, true, false),
+        (48000, 48000, u64::MAX, 1, 100, 100, 512, true, false),
+        (48000, 48000, 1, u64::MAX, 100, 100, 512, true, false),
+        (256, 1, 1, 1, 257, 257, 512, true, true),
+    ] {
+        let config = Settings {
+            capacity: c,
+            input_rate_hz: fi,
+            output_rate_hz: fo,
+            reserve: r,
+            target: t,
+            max_producer: p,
+            max_output: n,
+            plc: if enabled {
+                PlcMode::G711AppendixI
+            } else {
+                PlcMode::Disabled
+            },
+        };
+        assert_eq!(config.validate().is_ok(), valid, "{config:?}");
+    }
+    assert_eq!(PlcMode::from_ffi(0), Ok(PlcMode::Disabled));
+    assert_eq!(PlcMode::from_ffi(1), Ok(PlcMode::G711AppendixI));
+    assert_eq!(PlcMode::from_ffi(2), Err(()));
+}
 use core::mem::size_of;
 use core::ptr;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use crate::ring::{
-    CreateError, MAXIMUM_CAPACITY, Quality, Ring, allocate_samples, attenuate_concealment,
-};
+use crate::ring::{CreateError, MAXIMUM_CAPACITY, Ring, allocate_samples};
 use crate::samplerate_adapter::{AdapterDescriptor, AdapterFunctions, load_functions};
 use crate::{
     ABI_VERSION, CObservation, Config, Descriptor, RESULT_ADAPTER_ERROR, RESULT_INVALID_ARGUMENT,
-    RESULT_NO_MEMORY, RESULT_OK, Rpcr2Ring, finish_ring_create, ring_create_with_adapter,
-    ring_create_with_adapter_and_allocator, ring_destroy, rpcr2_descriptor,
+    RESULT_NO_MEMORY, RESULT_OK, Rpcr3Ring, finish_ring_create, ring_create_with_adapter,
+    ring_create_with_adapter_and_allocator, ring_destroy, rpcr3_descriptor,
 };
 
 const OK: c_int = 0;
@@ -21,13 +71,22 @@ const ERROR: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.samplerate\0";
 const WRONG_CAPABILITY_NAME: &[u8] = b"test.samplerate-adapter\0";
 
-thread_local! { static FAIL_BYTES: Cell<usize> = const { Cell::new(0) }; }
+thread_local! {
+    static FAIL_BYTES: Cell<usize> = const { Cell::new(0) };
+    static FAIL_AFTER: Cell<usize> = const { Cell::new(1) };
+    static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 struct Allocator;
 
 fn reject(bytes: usize) -> bool {
+    let _ = ALLOCATION_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
     FAIL_BYTES
         .try_with(|slot| {
             if slot.get() == bytes {
+                if FAIL_AFTER.get() > 1 {
+                    FAIL_AFTER.set(FAIL_AFTER.get() - 1);
+                    return false;
+                }
                 slot.set(0);
                 true
             } else {
@@ -63,14 +122,24 @@ unsafe impl GlobalAlloc for Allocator {
 static ALLOCATOR: Allocator = Allocator;
 
 fn fail_allocation<T>(bytes: usize, operation: impl FnOnce() -> T) -> T {
+    fail_allocation_at(bytes, 1, operation)
+}
+
+pub(crate) fn fail_allocation_at<T>(
+    bytes: usize,
+    occurrence: usize,
+    operation: impl FnOnce() -> T,
+) -> T {
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
             FAIL_BYTES.set(0);
+            FAIL_AFTER.set(1);
         }
     }
     assert_ne!(bytes, 0);
     assert_eq!(FAIL_BYTES.replace(bytes), 0);
+    FAIL_AFTER.set(occurrence);
     let _clear = Clear;
     let result = operation();
     assert_eq!(FAIL_BYTES.get(), 0, "selected allocation was not reached");
@@ -79,8 +148,15 @@ fn fail_allocation<T>(bytes: usize, operation: impl FnOnce() -> T) -> T {
 
 struct FakeConverter;
 
-unsafe extern "C" fn fake_create(quality: c_int, channels: u32, output: *mut *mut c_void) -> c_int {
-    if quality > 2 || channels != 1 || output.is_null() {
+unsafe extern "C" fn fake_create(
+    input_rate: u32,
+    output_rate: u32,
+    max_input: u32,
+    max_output: u32,
+    output: *mut *mut c_void,
+) -> c_int {
+    if input_rate == 0 || output_rate == 0 || max_input == 0 || max_output == 0 || output.is_null()
+    {
         return ERROR;
     }
     let converter = Box::new(FakeConverter);
@@ -125,6 +201,11 @@ unsafe extern "C" fn fake_process(
     OK
 }
 
+unsafe extern "C" fn fake_queued_input(_converter: *mut c_void, frames: *mut u32) -> c_int {
+    unsafe { *frames = 0 };
+    OK
+}
+
 unsafe extern "C" fn fake_destroy(converter: *mut c_void) {
     if !converter.is_null() {
         unsafe {
@@ -135,12 +216,14 @@ unsafe extern "C" fn fake_destroy(converter: *mut c_void) {
 
 pub(crate) static FAKE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 unsafe extern "C" fn failing_process(
@@ -194,7 +277,6 @@ unsafe extern "C" fn consume_one_zero_output_process(
 ) -> c_int {
     if converter.is_null()
         || input.is_null()
-        || input_frames == 0
         || output.is_null()
         || input_used.is_null()
         || output_generated.is_null()
@@ -204,7 +286,7 @@ unsafe extern "C" fn consume_one_zero_output_process(
         return ERROR;
     }
     unsafe {
-        *input_used = 1;
+        *input_used = input_frames.min(1);
         *output_generated = 0;
     }
     OK
@@ -212,55 +294,67 @@ unsafe extern "C" fn consume_one_zero_output_process(
 
 pub(crate) static FAILING_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(failing_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 pub(crate) static ZERO_PROGRESS_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(zero_progress_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static CONSUME_ONE_ZERO_OUTPUT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(consume_one_zero_output_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static WRONG_CAPABILITY_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: WRONG_CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 unsafe extern "C" fn create_fails(
-    _quality: c_int,
-    _channels: u32,
+    _input_rate: u32,
+    _output_rate: u32,
+    _max_input: u32,
+    _max_output: u32,
     _output: *mut *mut c_void,
 ) -> c_int {
     ERROR
 }
 
 unsafe extern "C" fn create_without_handle(
-    _quality: c_int,
-    _channels: u32,
+    _input_rate: u32,
+    _output_rate: u32,
+    _max_input: u32,
+    _max_output: u32,
     _output: *mut *mut c_void,
 ) -> c_int {
     OK
@@ -312,67 +406,84 @@ unsafe extern "C" fn invalid_output_count_process(
 
 pub(crate) static CREATE_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(create_fails),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static NULL_HANDLE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(create_without_handle),
     converter_reset: Some(fake_reset),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static RESET_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(reset_fails),
     converter_process: Some(fake_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static INVALID_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(invalid_count_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 static INVALID_OUTPUT_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     struct_size: size_of::<AdapterDescriptor>() as u32,
-    abi_version: 1,
+    abi_version: 2,
     capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
     converter_create: Some(fake_create),
     converter_reset: Some(fake_reset),
     converter_process: Some(invalid_output_count_process),
     converter_destroy: Some(fake_destroy),
+    converter_queued_input: Some(fake_queued_input),
+    converter_output_delay: Some(fake_queued_input),
 };
 
 pub(crate) fn adapter(descriptor: &AdapterDescriptor) -> AdapterFunctions {
     unsafe { AdapterFunctions::from_descriptor(descriptor) }.expect("valid test adapter")
 }
 
+pub(crate) fn settings(capacity: usize, input_rate_hz: u32, output_rate_hz: u32) -> Settings {
+    Settings {
+        capacity: capacity as u64,
+        input_rate_hz,
+        output_rate_hz,
+        reserve: 0,
+        target: 0,
+        max_producer: capacity.max(1) as u64,
+        max_output: capacity.max(1) as u64,
+        plc: PlcMode::Disabled,
+    }
+}
+
 fn ring(capacity: usize) -> Ring {
-    Ring::create(
-        capacity,
-        8_000,
-        8_000,
-        Quality::Best,
-        adapter(&FAKE_DESCRIPTOR),
-    )
-    .expect("test ring allocation")
+    Ring::create(settings(capacity, 8_000, 8_000), adapter(&FAKE_DESCRIPTOR))
+        .expect("test ring allocation")
 }
 
 fn valid_config() -> Config {
@@ -382,20 +493,24 @@ fn valid_config() -> Config {
         capacity_samples: 512,
         input_rate_hz: 8_000,
         output_rate_hz: 8_000,
-        quality: 0,
+        reserve_samples: 0,
+        target_samples: 0,
+        max_producer_samples: 512,
+        max_output_samples: 512,
+        plc_mode: 0,
     }
 }
 
 fn descriptor() -> &'static Descriptor {
-    let descriptor = rpcr2_descriptor();
+    let descriptor = rpcr3_descriptor();
     assert!(!descriptor.is_null());
     unsafe { &*descriptor }
 }
 
-struct TestHandle(*mut Rpcr2Ring);
+struct TestHandle(*mut Rpcr3Ring);
 
 impl TestHandle {
-    fn as_ptr(&self) -> *mut Rpcr2Ring {
+    fn as_ptr(&self) -> *mut Rpcr3Ring {
         self.0
     }
 }
@@ -429,21 +544,13 @@ unsafe fn null_allocator(_layout: Layout) -> *mut u8 {
 }
 
 #[test]
-fn quality_accepts_only_published_values() {
-    assert_eq!(Quality::from_ffi(0), Ok(Quality::Best));
-    assert_eq!(Quality::from_ffi(1), Ok(Quality::Medium));
-    assert_eq!(Quality::from_ffi(2), Ok(Quality::Fastest));
-    assert_eq!(Quality::from_ffi(3), Err(()));
-}
-
-#[test]
 fn producer_and_renderer_preserve_canonical_f32() {
     let ring = ring(512);
     assert!(ring.producer_push_sample(2.0));
     assert!(ring.producer_push_sample(f32::NAN));
     assert!(ring.producer_push_sample(-0.25));
     let mut output = [0.0; 3];
-    assert_eq!(ring.consumer_render(&mut output, 0, 0).0, 3);
+    assert_eq!(ring.consumer_render(&mut output).0, 3);
     assert_eq!(output, [1.0, 0.0, -0.25]);
 }
 
@@ -452,7 +559,7 @@ fn full_producer_rejects_only_new_samples() {
     let ring = ring(512);
     assert_eq!(ring.producer_push(&vec![0.1; 512]), 512);
     assert_eq!(ring.producer_push(&[0.2, 0.3]), 0);
-    let (_, real, adapter_error) = ring.consumer_render_sample(0);
+    let (_, real, adapter_error) = ring.consumer_render_sample();
     assert!(real);
     assert!(!adapter_error);
     assert_eq!(ring.producer_push(&[0.4]), 1);
@@ -463,14 +570,22 @@ fn full_producer_rejects_only_new_samples() {
 
 #[test]
 fn rendering_primes_startup_to_reserve() {
-    let ring = ring(512);
+    let ring = Ring::create(
+        Settings {
+            reserve: 12,
+            target: 8,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
     assert_eq!(ring.producer_push(&[0.1, 0.2, 0.3, 0.4]), 4);
     let mut output = [0.0; 4];
-    assert_eq!(ring.consumer_render(&mut output, 12, 8).0, 0);
+    assert_eq!(ring.consumer_render(&mut output).0, 0);
     assert_eq!(output, [0.0; 4]);
 
     assert_eq!(ring.producer_push(&[0.5; 8]), 8);
-    assert_eq!(ring.consumer_render(&mut output, 12, 8).0, 4);
+    assert_eq!(ring.consumer_render(&mut output).0, 4);
     assert_eq!(output, [0.1, 0.2, 0.3, 0.4]);
     let observation = ring.observe();
     assert_eq!(observation.reserve_samples, 12);
@@ -479,91 +594,387 @@ fn rendering_primes_startup_to_reserve() {
 }
 
 #[test]
-fn clock_controller_changes_ratio_only_after_an_observation_update() {
-    let ring = ring(512);
-    let input = [0.1; 16];
-    assert_eq!(ring.producer_push(&input), 16);
-    let mut first = [0.0; 8];
-    assert_eq!(ring.consumer_render(&mut first, 0, 1).0, 8);
-    assert_eq!(ring.producer_push(&input), 16);
-    let mut second = [0.0; 16];
-    assert_eq!(ring.consumer_render(&mut second, 0, 1).0, 16);
-    assert!(ring.observe().ratio_correction_ppm < 0);
+fn sample_rendering_cannot_bypass_an_unprimed_reserve() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 12,
+            target: 8,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    ring.producer_push(&[0.5; 4]);
+    ring.consumer_render(&mut [0.0; 1]);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.available(), 4);
+    assert_eq!(ring.observe().missing_samples, 0);
 }
 
 #[test]
-fn renderer_conceals_shortfall_once_and_recovers() {
+fn shortfall_without_plc_is_silence_and_resumes_without_repriming() {
     let ring = ring(512);
-    let input: Vec<f32> = (0..512)
-        .map(|index| ((index as f32 * 0.11).sin() * 0.7).clamp(-1.0, 1.0))
-        .collect();
-    assert_eq!(ring.producer_push(&input), 512);
-    let mut real = vec![0.0; 512];
-    assert_eq!(ring.consumer_render(&mut real, 0, 32).0, 512);
-    let (concealed, is_real, adapter_error) = ring.consumer_render_sample(32);
-    assert!(!is_real);
-    assert!(!adapter_error);
-    assert_ne!(concealed, 0.0);
-    let observation = ring.observe();
-    assert_eq!(observation.missing_samples, 1);
-    assert_eq!(observation.consecutive_shortfall_samples, 1);
+    ring.producer_push(&[0.5; 512]);
+    ring.consumer_render(&mut [0.0; 512]);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.observe().missing_samples, 1);
+    ring.producer_push(&[0.3]);
+    assert_eq!(ring.consumer_render_sample(), (0.3, true, false));
+}
 
-    assert_eq!(ring.producer_push(&[0.6, 0.5]), 2);
-    let (_, recovered, adapter_error) = ring.consumer_render_sample(32);
-    assert!(recovered);
-    assert!(!adapter_error);
+#[test]
+fn enabled_ring_distinguishes_priming_lookahead_and_real_shortfall() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 34,
+            target: 128,
+            max_producer: 128,
+            max_output: 32,
+            plc: PlcMode::G711AppendixI,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    ring.producer_push(&[0.5; 16]);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.observe().missing_samples, 0);
+    ring.producer_push(&[0.5; 112]);
+    for _ in 0..30 {
+        assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+    for _ in 30..128 {
+        assert_eq!(ring.consumer_render_sample(), (0.5, true, false));
+    }
+    // Source loss and delayed real output are separate facts.
+    assert_eq!(ring.consumer_render_sample(), (0.5, true, false));
+    assert_eq!(ring.observe().missing_samples, 1);
+    for _ in 1..510 {
+        ring.consumer_render_sample();
+    }
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    ring.producer_push(&[0.4]);
+    ring.consumer_render_sample();
     assert_eq!(ring.observe().consecutive_shortfall_samples, 0);
+    ring.consumer_reset().unwrap();
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+}
+
+#[test]
+fn actual_adapter_short_source_fifo_retains_full_output_pitch_history() {
+    let ring = Ring::create(
+        Settings {
+            capacity: 640,
+            input_rate_hz: 8000,
+            output_rate_hz: 48000,
+            reserve: 162,
+            target: 320,
+            max_producer: 160,
+            max_output: 960,
+            plc: PlcMode::G711AppendixI,
+        },
+        load_functions().unwrap(),
+    )
+    .unwrap();
+    let mut output = [0.0; 960];
+    for _ in 0..2 {
+        ring.producer_push(&[0.5; 160]);
+    }
+    for _ in 0..12 {
+        ring.producer_push(&[0.5; 160]);
+        ring.consumer_render(&mut output);
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+    let mut found = false;
+    for _ in 0..10000 {
+        let (sample, _, failed) = ring.consumer_render_sample();
+        assert!(!failed);
+        if ring.observe().consecutive_shortfall_samples == 1621 {
+            // 1440 synthesized samples plus the 180-sample lookahead: 30 ms loss.
+            assert!((sample - 0.3).abs() < 0.002, "{sample}");
+            found = true;
+            break;
+        }
+    }
+    assert!(found);
+}
+
+#[test]
+fn actual_adapter_partitioning_preserves_loss_recovery_and_reset() {
+    let config = Settings {
+        capacity: 640,
+        input_rate_hz: 8000,
+        output_rate_hz: 48000,
+        reserve: 162,
+        target: 320,
+        max_producer: 160,
+        max_output: 960,
+        plc: PlcMode::G711AppendixI,
+    };
+    let a = Ring::create(config, load_functions().unwrap()).unwrap();
+    let b = Ring::create(config, load_functions().unwrap()).unwrap();
+    for block in 0..40 {
+        if block % 9 != 5 {
+            let input = core::array::from_fn::<_, 160, _>(|i| {
+                (((block * 160 + i) as f32) * 0.17).sin() * 0.5
+            });
+            assert_eq!(a.producer_push(&input), b.producer_push(&input));
+        }
+        let mut expected = [0.0; 960];
+        let (expected_real, expected_error) = a.consumer_render(&mut expected);
+        let mut actual = [0.0; 960];
+        let mut offset = 0;
+        let mut real = 0;
+        for count in [1, 7, 32, 128, 256, 536] {
+            let (produced, failed) = b.consumer_render(&mut actual[offset..offset + count]);
+            assert!(!failed);
+            real += produced;
+            offset += count;
+        }
+        assert!(!expected_error);
+        assert_eq!(real, expected_real);
+        assert_eq!(actual, expected);
+        assert_eq!(a.observe().missing_samples, b.observe().missing_samples);
+        assert_eq!(
+            a.observe().ratio_correction_ppm,
+            b.observe().ratio_correction_ppm
+        );
+        if block % 11 == 10 {
+            a.consumer_reset().unwrap();
+            b.consumer_reset().unwrap();
+        }
+    }
+}
+
+#[test]
+fn actual_adapter_reset_removes_all_previous_burst_pcm() {
+    let ring = Ring::create(settings(1024, 8000, 48000), load_functions().unwrap()).unwrap();
+    ring.producer_push(&[0.75; 512]);
+    let mut output = [0.0; 960];
+    assert_eq!(ring.consumer_render(&mut output), (960, false));
+    ring.consumer_reset().unwrap();
+    ring.producer_push(&[0.0; 512]);
+    assert_eq!(ring.consumer_render(&mut output), (960, false));
+    assert_eq!(output, [0.0; 960]);
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
+fn actual_adapter_reported_delay_aligns_the_impulse_peak() {
+    for (input_rate, output_rate) in [
+        (8000, 48000),
+        (48000, 8000),
+        (48000, 48000),
+        (44100, 48000),
+        (48000, 44100),
+    ] {
+        let ring = Ring::create(
+            settings(4096, input_rate, output_rate),
+            load_functions().unwrap(),
+        )
+        .unwrap();
+        let mut input = [0.0; 4096];
+        input[0] = 0.5;
+        assert_eq!(ring.producer_push(&input), 4096);
+        let mut output = [0.0; 2048];
+        let (_, failed) = ring.consumer_render(&mut output);
+        assert!(!failed);
+        let peak = output
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .unwrap()
+            .0;
+        assert!(
+            peak.abs_diff(ring.output_delay_samples() as usize) <= 1,
+            "{input_rate}->{output_rate}: peak={peak}, delay={}",
+            ring.output_delay_samples()
+        );
+    }
+}
+
+#[test]
+fn callback_partitioning_does_not_change_priming_plc_or_recovery() {
+    let config = Settings {
+        reserve: 40,
+        target: 128,
+        max_producer: 128,
+        max_output: 32,
+        plc: PlcMode::G711AppendixI,
+        ..settings(512, 8000, 8000)
+    };
+    let a = Ring::create(config, adapter(&FAKE_DESCRIPTOR)).unwrap();
+    let b = Ring::create(config, adapter(&FAKE_DESCRIPTOR)).unwrap();
+    for burst in 0..8 {
+        if burst % 3 != 1 {
+            a.producer_push(&[0.25; 128]);
+            b.producer_push(&[0.25; 128]);
+        }
+        for count in [1, 7, 32, 16, 8, 32, 32] {
+            let mut output = [0.0; 32];
+            let (real, failed) = b.consumer_render(&mut output[..count]);
+            let mut expected_real = 0;
+            for &sample in &output[..count] {
+                let (expected, is_real, error) = a.consumer_render_sample();
+                assert_eq!(sample, expected);
+                assert!(!error);
+                expected_real += u64::from(is_real);
+            }
+            assert_eq!((real, failed), (expected_real, false));
+        }
+    }
+    assert_eq!(a.observe().missing_samples, b.observe().missing_samples);
+}
+
+#[test]
+fn rendering_drains_adapter_pcm_after_the_source_fifo_is_empty() {
+    unsafe extern "C" fn create(
+        _input_rate: u32,
+        _output_rate: u32,
+        _max_input: u32,
+        _max_output: u32,
+        output: *mut *mut c_void,
+    ) -> c_int {
+        unsafe { *output = Box::into_raw(Box::new(0_u32)).cast() };
+        OK
+    }
+    unsafe extern "C" fn destroy(handle: *mut c_void) {
+        unsafe { drop(Box::from_raw(handle.cast::<u32>())) };
+    }
+    unsafe extern "C" fn process(
+        handle: *mut c_void,
+        _input: *const f32,
+        input_frames: u32,
+        output: *mut f32,
+        output_capacity: u32,
+        _ratio: f64,
+        used: *mut u32,
+        generated: *mut u32,
+    ) -> c_int {
+        let pending = unsafe { &mut *handle.cast::<u32>() };
+        *pending += input_frames;
+        let count = if input_frames == 0 {
+            *pending
+        } else {
+            *pending / 2
+        }
+        .min(output_capacity);
+        unsafe {
+            core::slice::from_raw_parts_mut(output, count as usize).fill(0.25);
+            *used = input_frames;
+            *generated = count;
+        }
+        *pending -= count;
+        OK
+    }
+    let descriptor = AdapterDescriptor {
+        converter_create: Some(create),
+        converter_process: Some(process),
+        converter_destroy: Some(destroy),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    assert_eq!(ring.producer_push(&[0.25; 128]), 128);
+    let mut output = [0.0; 128];
+    assert_eq!(ring.consumer_render(&mut output), (128, false));
+    assert_eq!(output, [0.25; 128]);
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
+fn producer_consumer_and_burst_reset_do_not_allocate() {
+    for plc in [PlcMode::Disabled, PlcMode::G711AppendixI] {
+        let ring = Ring::create(
+            Settings {
+                reserve: 40,
+                target: 128,
+                max_producer: 128,
+                max_output: 32,
+                plc,
+                ..settings(512, 8000, 8000)
+            },
+            adapter(&FAKE_DESCRIPTOR),
+        )
+        .unwrap();
+        let mut output = [0.0; 32];
+        let before = ALLOCATION_COUNT.get();
+        for i in 0..100 {
+            if i % 3 != 1 {
+                ring.producer_push(&[0.5; 128]);
+            }
+            for _ in 0..4 {
+                ring.consumer_render(&mut output);
+            }
+        }
+        ring.consumer_reset().unwrap();
+        assert_eq!(ALLOCATION_COUNT.get(), before);
+    }
+}
+
+#[test]
+fn clock_controller_changes_ratio_only_after_an_observation_update() {
+    let ring = Ring::create(
+        Settings {
+            target: 1,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    let input = [0.1; 16];
+    assert_eq!(ring.producer_push(&input), 16);
+    let mut first = [0.0; 8];
+    assert_eq!(ring.consumer_render(&mut first).0, 8);
+    assert_eq!(ring.producer_push(&input), 16);
+    let mut second = [0.0; 16];
+    assert_eq!(ring.consumer_render(&mut second).0, 16);
+    assert!(ring.observe().ratio_correction_ppm < 0);
 }
 
 #[test]
 fn construction_rejects_invalid_parameters() {
     let first_adapter = adapter(&FAKE_DESCRIPTOR);
-    assert!(Ring::create(0, 8_000, 8_000, Quality::Best, first_adapter).is_err());
+    assert!(Ring::create(settings(0, 8_000, 8_000), first_adapter).is_err());
     let second_adapter = adapter(&FAKE_DESCRIPTOR);
-    assert!(Ring::create(512, 0, 8_000, Quality::Best, second_adapter).is_err());
+    assert!(Ring::create(settings(512, 0, 8_000), second_adapter).is_err());
     let third_adapter = adapter(&FAKE_DESCRIPTOR);
-    assert!(Ring::create(512, 8_000, 0, Quality::Best, third_adapter).is_err());
+    assert!(Ring::create(settings(512, 8_000, 0), third_adapter).is_err());
 }
 
 #[test]
 fn construction_handles_control_plane_allocation_failure_without_panicking() {
     let too_large = Ring::create(
-        usize::MAX,
-        8_000,
-        8_000,
-        Quality::Best,
+        settings(usize::MAX, 8_000, 8_000),
         adapter(&FAKE_DESCRIPTOR),
     );
-    assert!(matches!(too_large, Err(CreateError::NoMemory)));
+    assert!(matches!(too_large, Err(CreateError::Invalid)));
     assert!(allocate_samples(usize::MAX).is_err());
 
-    let no_memory = fail_allocation(512 * size_of::<f32>(), || {
-        Ring::create(512, 8_000, 8_000, Quality::Best, adapter(&FAKE_DESCRIPTOR))
+    for occurrence in 1..=3 {
+        let no_memory = fail_allocation_at(512 * size_of::<f32>(), occurrence, || {
+            Ring::create(settings(512, 8_000, 8_000), adapter(&FAKE_DESCRIPTOR))
+        });
+        assert!(matches!(no_memory, Err(CreateError::NoMemory)));
+    }
+
+    let no_plc_memory = fail_allocation(390 * size_of::<f32>(), || {
+        Ring::create(
+            Settings {
+                reserve: 40,
+                target: 128,
+                max_producer: 128,
+                max_output: 32,
+                plc: PlcMode::G711AppendixI,
+                ..settings(512, 8000, 8000)
+            },
+            adapter(&FAKE_DESCRIPTOR),
+        )
     });
-    assert!(matches!(no_memory, Err(CreateError::NoMemory)));
+    assert!(matches!(no_plc_memory, Err(CreateError::NoMemory)));
 
     let ring = ring(512);
     assert!(crate::allocate_ring_handle_with(ring, null_allocator).is_err());
-}
-
-#[test]
-fn every_published_converter_quality_constructs_a_ring() {
-    let medium = Ring::create(
-        512,
-        8_000,
-        8_000,
-        Quality::Medium,
-        adapter(&FAKE_DESCRIPTOR),
-    );
-    assert!(medium.is_ok());
-    let fastest = Ring::create(
-        512,
-        8_000,
-        8_000,
-        Quality::Fastest,
-        adapter(&FAKE_DESCRIPTOR),
-    );
-    assert!(fastest.is_ok());
 }
 
 #[test]
@@ -573,16 +984,10 @@ fn descriptor_rejects_an_unselected_adapter_capability() {
 
 #[test]
 fn converter_failure_is_visible_without_skipping_concealment() {
-    let ring = Ring::create(
-        512,
-        8_000,
-        8_000,
-        Quality::Best,
-        adapter(&FAILING_DESCRIPTOR),
-    )
-    .expect("test ring allocation");
+    let ring = Ring::create(settings(512, 8_000, 8_000), adapter(&FAILING_DESCRIPTOR))
+        .expect("test ring allocation");
     assert_eq!(ring.producer_push(&[0.4]), 1);
-    let (_, real, adapter_error) = ring.consumer_render_sample(4);
+    let (_, real, adapter_error) = ring.consumer_render_sample();
     assert!(!real);
     assert!(adapter_error);
     assert_eq!(ring.observe().adapter_error_count, 1);
@@ -592,18 +997,15 @@ fn converter_failure_is_visible_without_skipping_concealment() {
 #[test]
 fn zero_progress_conversion_gathers_more_then_reports_a_fault() {
     let ring = Ring::create(
-        512,
-        8_000,
-        8_000,
-        Quality::Best,
+        settings(512, 8_000, 8_000),
         adapter(&ZERO_PROGRESS_DESCRIPTOR),
     )
     .expect("test ring allocation");
     assert_eq!(ring.producer_push(&vec![0.2; 512]), 512);
-    let (_, first_real, first_error) = ring.consumer_render_sample(8);
+    let (_, first_real, first_error) = ring.consumer_render_sample();
     assert!(!first_real);
     assert!(!first_error);
-    let (_, second_real, second_error) = ring.consumer_render_sample(8);
+    let (_, second_real, second_error) = ring.consumer_render_sample();
     assert!(!second_real);
     assert!(second_error);
     assert_eq!(ring.observe().adapter_error_count, 1);
@@ -611,11 +1013,11 @@ fn zero_progress_conversion_gathers_more_then_reports_a_fault() {
 
 #[test]
 fn controller_clamps_the_adapter_ratio_at_its_documented_boundary() {
-    let ring = Ring::create(512, 1, 256, Quality::Best, adapter(&FAKE_DESCRIPTOR))
+    let ring = Ring::create(settings(512, 1, 256), adapter(&FAKE_DESCRIPTOR))
         .expect("boundary-rate ring allocation");
     assert_eq!(ring.producer_push(&vec![0.1; 512]), 512);
     let mut output = [0.0; 2];
-    assert_eq!(ring.consumer_render(&mut output, 0, 1).0, 2);
+    assert_eq!(ring.consumer_render(&mut output).0, 2);
     assert_eq!(ring.observe().adapter_error_count, 0);
     assert!(ring.observe().ratio_correction_ppm <= 0);
 }
@@ -626,7 +1028,7 @@ fn partial_block_acceptance_preserves_the_chronological_prefix() {
     assert_eq!(ring.producer_push(&vec![0.1; 510]), 510);
     assert_eq!(ring.producer_push(&[0.2, 0.3, 0.4, 0.5]), 2);
     let mut output = vec![0.0; 512];
-    assert_eq!(ring.consumer_render(&mut output, 0, 0).0, 512);
+    assert_eq!(ring.consumer_render(&mut output).0, 512);
     assert!(output[..510].iter().all(|sample| *sample == 0.1));
     assert_eq!(&output[510..], &[0.2, 0.3]);
     assert_eq!(ring.observe().discarded_samples, 2);
@@ -635,16 +1037,13 @@ fn partial_block_acceptance_preserves_the_chronological_prefix() {
 #[test]
 fn refill_compacts_pending_input_after_partial_zero_output_conversion() {
     let ring = Ring::create(
-        512,
-        8_000,
-        8_000,
-        Quality::Best,
+        settings(512, 8_000, 8_000),
         adapter(&CONSUME_ONE_ZERO_OUTPUT_DESCRIPTOR),
     )
     .expect("test ring allocation");
     assert_eq!(ring.producer_push(&vec![0.2; 512]), 512);
     for _ in 0..258 {
-        let (_, real, adapter_error) = ring.consumer_render_sample(8);
+        let (_, real, adapter_error) = ring.consumer_render_sample();
         assert!(!real);
         assert!(!adapter_error);
     }
@@ -654,127 +1053,39 @@ fn refill_compacts_pending_input_after_partial_zero_output_conversion() {
 
 #[test]
 fn controller_clamps_at_both_documented_ratio_limits() {
-    let lower = Ring::create(512, 256, 1, Quality::Best, adapter(&FAKE_DESCRIPTOR))
-        .expect("lower-bound ring allocation");
+    let lower = Ring::create(
+        Settings {
+            target: 1,
+            ..settings(512, 256, 1)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .expect("lower-bound ring allocation");
     assert_eq!(lower.producer_push(&vec![0.2; 512]), 512);
     let mut lower_first = vec![0.0; 256];
-    assert_eq!(lower.consumer_render(&mut lower_first, 0, 1).0, 256);
+    assert_eq!(lower.consumer_render(&mut lower_first).0, 256);
     assert_eq!(lower.producer_push(&vec![0.2; 256]), 256);
-    let (_, lower_real, lower_error) = lower.consumer_render_sample(1);
+    let (_, lower_real, lower_error) = lower.consumer_render_sample();
     assert!(lower_real);
     assert!(!lower_error);
     assert_eq!(lower.observe().ratio_correction_ppm, 0);
 
-    let upper = Ring::create(512, 1, 256, Quality::Best, adapter(&FAKE_DESCRIPTOR))
-        .expect("upper-bound ring allocation");
+    let upper = Ring::create(
+        Settings {
+            target: 512,
+            ..settings(512, 1, 256)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .expect("upper-bound ring allocation");
     assert_eq!(upper.producer_push(&vec![0.2; 512]), 512);
     let mut upper_first = vec![0.0; 256];
-    assert_eq!(upper.consumer_render(&mut upper_first, 0, u64::MAX).0, 256);
+    assert_eq!(upper.consumer_render(&mut upper_first).0, 256);
     assert_eq!(upper.producer_push(&vec![0.2; 256]), 256);
-    let (_, upper_real, upper_error) = upper.consumer_render_sample(u64::MAX);
+    let (_, upper_real, upper_error) = upper.consumer_render_sample();
     assert!(upper_real);
     assert!(!upper_error);
     assert_eq!(upper.observe().ratio_correction_ppm, 0);
-}
-
-#[test]
-fn concealment_fades_and_recovers_at_its_sample_boundaries() {
-    let ring = ring(512);
-    assert_eq!(ring.producer_push(&vec![0.6; 512]), 512);
-    let mut source = vec![0.0; 512];
-    assert_eq!(ring.consumer_render(&mut source, 0, 32).0, 512);
-
-    let mut concealed = Vec::new();
-    for _ in 0..481 {
-        let (sample, real, adapter_error) = ring.consumer_render_sample(32);
-        assert!(!real);
-        assert!(!adapter_error);
-        concealed.push(sample);
-    }
-    assert_ne!(concealed[0], 0.0);
-    assert_ne!(concealed[80], 0.0);
-    assert_ne!(concealed[159], 0.0);
-    assert_eq!(concealed[160], 0.0);
-
-    assert_eq!(ring.producer_push(&vec![0.4; 512]), 512);
-    for _ in 0..64 {
-        let (_, real, adapter_error) = ring.consumer_render_sample(32);
-        assert!(real);
-        assert!(!adapter_error);
-    }
-    let (recovered, real, adapter_error) = ring.consumer_render_sample(32);
-    assert!(real);
-    assert!(!adapter_error);
-    assert_eq!(recovered, 0.4);
-}
-
-#[test]
-fn recovery_uses_the_frozen_concealment_waveform_phase() {
-    let ring = ring(512);
-    let source: Vec<f32> = (0..512)
-        .map(|index| (core::f32::consts::TAU * index as f32 / 80.0).sin())
-        .collect();
-    assert_eq!(ring.producer_push(&source), source.len() as u64);
-    let mut played = vec![0.0; source.len()];
-    assert_eq!(
-        ring.consumer_render(&mut played, 0, 0).0,
-        source.len() as u64
-    );
-
-    for _ in 0..2 {
-        let (_, real, adapter_error) = ring.consumer_render_sample(0);
-        assert!(!real);
-        assert!(!adapter_error);
-    }
-    assert_eq!(ring.producer_push(&[0.0, 0.0]), 2);
-
-    let crossfade = 64.0_f32;
-    let (first, first_real, first_error) = ring.consumer_render_sample(0);
-    assert!(first_real);
-    assert!(!first_error);
-    let expected_first = ((1.0 - 1.0 / (crossfade + 1.0)).sqrt()) * source[434];
-    assert!((first - expected_first).abs() < 0.000_001);
-
-    let (second, second_real, second_error) = ring.consumer_render_sample(0);
-    assert!(second_real);
-    assert!(!second_error);
-    let expected_second = ((1.0 - 2.0 / (crossfade + 1.0)).sqrt()) * source[435];
-    assert!((second - expected_second).abs() < 0.000_001);
-}
-
-#[test]
-fn low_rate_plc_uses_safe_pitch_and_zero_crossfade_fallbacks() {
-    let ring = Ring::create(512, 1, 1, Quality::Best, adapter(&FAKE_DESCRIPTOR))
-        .expect("low-rate ring allocation");
-    assert_eq!(ring.producer_push(&vec![0.6; 512]), 512);
-    let mut source = vec![0.0; 512];
-    assert_eq!(ring.consumer_render(&mut source, 0, 0).0, 512);
-
-    let (concealed, real, adapter_error) = ring.consumer_render_sample(0);
-    assert_eq!(concealed, 0.0);
-    assert!(!real);
-    assert!(!adapter_error);
-
-    assert!(ring.producer_push_sample(0.4));
-    let (recovered, real, adapter_error) = ring.consumer_render_sample(0);
-    assert_eq!(recovered, 0.4);
-    assert!(real);
-    assert!(!adapter_error);
-
-    let high_rate = Ring::create(
-        512,
-        48_000,
-        48_000,
-        Quality::Best,
-        adapter(&FAKE_DESCRIPTOR),
-    )
-    .expect("high-rate ring allocation");
-    let (_, high_rate_real, high_rate_error) = high_rate.consumer_render_sample(0);
-    assert!(!high_rate_real);
-    assert!(!high_rate_error);
-
-    assert_eq!(attenuate_concealment(0.5, 1, 1), 0.5);
-    assert_eq!(attenuate_concealment(0.5, 0, 8_000), 0.5);
 }
 
 #[test]
@@ -783,86 +1094,245 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
 
     let undersized = AdapterDescriptor {
         struct_size: 0,
-        abi_version: 1,
-        capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
-        converter_create: Some(fake_create),
-        converter_reset: Some(fake_reset),
-        converter_process: Some(fake_process),
-        converter_destroy: Some(fake_destroy),
-    };
-    assert!(unsafe { AdapterFunctions::from_descriptor(&undersized) }.is_err());
-
-    let incompatible_abi = AdapterDescriptor {
-        struct_size: size_of::<AdapterDescriptor>() as u32,
         abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&undersized) }.is_err());
+
+    let incompatible_abi = AdapterDescriptor {
+        struct_size: size_of::<AdapterDescriptor>() as u32,
+        abi_version: 1,
+        capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
+        converter_create: Some(fake_create),
+        converter_reset: Some(fake_reset),
+        converter_process: Some(fake_process),
+        converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&incompatible_abi) }.is_err());
 
     let missing_capability = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: ptr::null(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_capability) }.is_err());
 
     let missing_create = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: None,
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_create) }.is_err());
 
     let missing_reset = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: None,
         converter_process: Some(fake_process),
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_reset) }.is_err());
 
     let missing_process = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: None,
         converter_destroy: Some(fake_destroy),
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_process) }.is_err());
 
     let missing_destroy = AdapterDescriptor {
         struct_size: size_of::<AdapterDescriptor>() as u32,
-        abi_version: 1,
+        abi_version: 2,
         capability_name: CAPABILITY_NAME.as_ptr().cast::<c_char>(),
         converter_create: Some(fake_create),
         converter_reset: Some(fake_reset),
         converter_process: Some(fake_process),
         converter_destroy: None,
+        converter_queued_input: Some(fake_queued_input),
+        converter_output_delay: Some(fake_queued_input),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_destroy) }.is_err());
+
+    let missing_queue = AdapterDescriptor {
+        converter_queued_input: None,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&missing_queue) }.is_err());
+    let missing_delay = AdapterDescriptor {
+        converter_output_delay: None,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&missing_delay) }.is_err());
+}
+
+#[test]
+fn adapter_binding_accepts_the_nominal_rate_abi() {
+    let descriptor = AdapterDescriptor {
+        abi_version: 2,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&descriptor) }.is_ok());
+}
+
+#[test]
+fn descriptor_exposes_intrinsic_output_delay_for_finite_media() {
+    assert!(descriptor().struct_size >= 88);
+    unsafe extern "C" fn delay(_handle: *mut c_void, frames: *mut u32) -> c_int {
+        unsafe { *frames = 77 };
+        OK
+    }
+    let handle = handle_with(adapter(&AdapterDescriptor {
+        converter_output_delay: Some(delay),
+        ..FAKE_DESCRIPTOR
+    }));
+    let mut samples = 123;
+    let query = descriptor().ring_output_delay;
+    assert_eq!(query(ptr::null(), &mut samples), RESULT_INVALID_ARGUMENT);
+    assert_eq!(samples, 123);
+    assert_eq!(
+        query(handle.as_ptr(), ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(query(handle.as_ptr(), &mut samples), RESULT_OK);
+    assert_eq!(samples, 77);
+    assert_eq!(
+        (descriptor().ring_consumer_reset)(handle.as_ptr()),
+        RESULT_OK
+    );
+    assert_eq!(query(handle.as_ptr(), &mut samples), RESULT_OK);
+    assert_eq!(samples, 77);
+}
+
+#[test]
+fn output_delay_failure_rejects_ring_creation() {
+    unsafe extern "C" fn delay(_handle: *mut c_void, _frames: *mut u32) -> c_int {
+        ERROR
+    }
+    assert!(matches!(
+        Ring::create(
+            settings(512, 8000, 8000),
+            adapter(&AdapterDescriptor {
+                converter_output_delay: Some(delay),
+                ..FAKE_DESCRIPTOR
+            })
+        ),
+        Err(CreateError::Adapter)
+    ));
+}
+
+#[test]
+fn controller_counts_adapter_backlog_in_input_samples() {
+    unsafe extern "C" fn queued(_handle: *mut c_void, frames: *mut u32) -> c_int {
+        unsafe { *frames = 128 };
+        OK
+    }
+    let descriptor = AdapterDescriptor {
+        converter_queued_input: Some(queued),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    ring.producer_push(&[0.25]);
+    assert_eq!(ring.consumer_render_sample(), (0.25, true, false));
+    assert_eq!(ring.observe().filtered_occupancy_samples, 129);
+    assert_eq!(ring.observe().available_samples, 0);
+}
+
+#[test]
+fn empty_playout_does_not_accelerate_the_clock_controller() {
+    let ring = Ring::create(
+        Settings {
+            target: 128,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    let mut output = [0.0; 256];
+    ring.producer_push(&[0.25; 512]);
+    ring.consumer_render(&mut output);
+    ring.consumer_render(&mut output);
+    let before = ring.observe();
+    for _ in 0..20 {
+        assert_eq!(ring.consumer_render(&mut output), (0, false));
+    }
+    let after = ring.observe();
+    assert_eq!(after.ratio_correction_ppm, before.ratio_correction_ppm);
+    assert_eq!(
+        after.filtered_occupancy_samples,
+        before.filtered_occupancy_samples
+    );
+}
+
+#[test]
+fn adapter_queue_failure_is_reported_as_a_converter_fault() {
+    unsafe extern "C" fn queued(_handle: *mut c_void, _frames: *mut u32) -> c_int {
+        ERROR
+    }
+    let descriptor = AdapterDescriptor {
+        converter_queued_input: Some(queued),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(settings(512, 8000, 8000), adapter(&descriptor)).unwrap();
+    ring.producer_push(&[0.25]);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.observe().adapter_error_count, 1);
+}
+
+#[test]
+fn ring_supplies_nominal_rates_and_internal_workspace_bounds() {
+    unsafe extern "C" fn create(
+        input_rate: u32,
+        output_rate: u32,
+        max_input: u32,
+        max_output: u32,
+        handle: *mut *mut c_void,
+    ) -> c_int {
+        if (input_rate, output_rate, max_input, max_output) != (8000, 48000, 640, 256) {
+            return ERROR;
+        }
+        unsafe { fake_create(input_rate, output_rate, max_input, max_output, handle) }
+    }
+    let descriptor = AdapterDescriptor {
+        converter_create: Some(create),
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(Ring::create(settings(640, 8000, 48000), adapter(&descriptor)).is_ok());
 }
 
 #[test]
 fn adapter_converter_lifecycle_validates_callback_results() {
     let mut converter = adapter(&FAKE_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("fake converter creation");
     let mut output = [0.0; 2];
     assert_eq!(
@@ -871,33 +1341,33 @@ fn adapter_converter_lifecycle_validates_callback_results() {
     );
     assert_eq!(output, [0.1, -0.2]);
     assert!(converter.reset().is_ok());
-    assert!(converter.process(&[], &mut output, 1.0).is_err());
+    assert_eq!(converter.process(&[], &mut output, 1.0), Ok((0, 0)));
     assert!(converter.process(&[0.1], &mut [], 1.0).is_err());
     assert!(converter.process(&[0.1], &mut output, 0.0).is_err());
     assert!(converter.process(&[0.1], &mut output, f64::NAN).is_err());
     assert!(
         adapter(&CREATE_FAILURE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
     assert!(
         adapter(&NULL_HANDLE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
     assert!(
         adapter(&RESET_FAILURE_DESCRIPTOR)
-            .create_converter(0)
+            .create_converter(8000, 8000, 512, 512)
             .is_err()
     );
 
     let mut invalid_counts = adapter(&INVALID_COUNT_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("invalid-count converter creation");
     assert!(invalid_counts.process(&[0.1], &mut output, 1.0).is_err());
 
     let mut invalid_output_counts = adapter(&INVALID_OUTPUT_COUNT_DESCRIPTOR)
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("invalid-output-count converter creation");
     assert!(
         invalid_output_counts
@@ -910,7 +1380,7 @@ fn adapter_converter_lifecycle_validates_callback_results() {
 fn dynamic_adapter_descriptor_is_usable_at_ring_construction_time() {
     let functions = load_functions().expect("installed dynamic adapter descriptor");
     let mut converter = functions
-        .create_converter(0)
+        .create_converter(8000, 8000, 512, 512)
         .expect("installed dynamic converter creation");
     let input = [0.1; 512];
     let mut output = [0.0; 512];
@@ -922,7 +1392,7 @@ fn dynamic_adapter_descriptor_is_usable_at_ring_construction_time() {
 }
 
 #[test]
-fn public_descriptor_exposes_the_complete_abi_v2_function_table() {
+fn public_descriptor_exposes_the_complete_abi_v3_function_table() {
     let descriptor = descriptor();
     assert_eq!(descriptor.struct_size, size_of::<Descriptor>() as u32);
     assert_eq!(descriptor.abi_version, ABI_VERSION);
@@ -956,12 +1426,12 @@ fn public_descriptor_constructs_with_the_installed_dynamic_adapter() {
 #[test]
 fn ring_create_classifies_invalid_configurations_and_adapter_failures() {
     let config = valid_config();
-    let mut output = ptr::NonNull::<Rpcr2Ring>::dangling().as_ptr();
+    let mut output = ptr::NonNull::<Rpcr3Ring>::dangling().as_ptr();
     assert_eq!(
         ring_create_with_adapter(ptr::null(), &mut output, Ok(adapter(&FAKE_DESCRIPTOR))),
         RESULT_INVALID_ARGUMENT
     );
-    assert!(output.is_null());
+    assert_eq!(output, ptr::NonNull::<Rpcr3Ring>::dangling().as_ptr());
     assert_eq!(
         ring_create_with_adapter(&config, ptr::null_mut(), Ok(adapter(&FAKE_DESCRIPTOR))),
         RESULT_INVALID_ARGUMENT
@@ -1004,7 +1474,7 @@ fn ring_create_classifies_invalid_configurations_and_adapter_failures() {
         RESULT_INVALID_ARGUMENT
     );
     invalid = valid_config();
-    invalid.quality = 3;
+    invalid.plc_mode = 3;
     assert_eq!(
         ring_create_with_adapter(&invalid, &mut output, Ok(adapter(&FAKE_DESCRIPTOR))),
         RESULT_INVALID_ARGUMENT
@@ -1023,6 +1493,16 @@ fn ring_create_classifies_invalid_configurations_and_adapter_failures() {
         RESULT_INVALID_ARGUMENT
     );
 
+    // Validated construction clears the output before entering this helper.
+    output = ptr::null_mut();
+    assert_eq!(
+        finish_ring_create(
+            ptr::NonNull::from(&mut output),
+            Err(CreateError::Invalid),
+            std::alloc::alloc
+        ),
+        RESULT_INVALID_ARGUMENT
+    );
     assert_eq!(
         finish_ring_create(
             ptr::NonNull::from(&mut output),
@@ -1149,42 +1629,28 @@ fn descriptor_operations_validate_pointers_and_report_complete_results() {
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), ptr::null_mut(), 0, &mut real),
+        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), ptr::null_mut(), &mut real),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, 0, ptr::null_mut()),
+        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, ptr::null_mut()),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render_sample)(ptr::null_mut(), &mut sample, 0, &mut real),
+        (descriptor.ring_consumer_render_sample)(ptr::null_mut(), &mut sample, &mut real),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, 0, &mut real),
+        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, &mut real),
         RESULT_OK
     );
     assert!(!real);
     assert_eq!(
-        (descriptor.ring_consumer_render)(
-            handle.as_ptr(),
-            ptr::null_mut(),
-            1,
-            0,
-            0,
-            &mut real_samples
-        ),
+        (descriptor.ring_consumer_render)(handle.as_ptr(), ptr::null_mut(), 1, &mut real_samples),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render)(
-            ptr::null_mut(),
-            one.as_mut_ptr(),
-            1,
-            0,
-            0,
-            &mut real_samples
-        ),
+        (descriptor.ring_consumer_render)(ptr::null_mut(), one.as_mut_ptr(), 1, &mut real_samples),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
@@ -1192,33 +1658,17 @@ fn descriptor_operations_validate_pointers_and_report_complete_results() {
             handle.as_ptr(),
             one.as_mut_ptr(),
             too_large,
-            0,
-            0,
             &mut real_samples
         ),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
-        (descriptor.ring_consumer_render)(
-            handle.as_ptr(),
-            ptr::null_mut(),
-            0,
-            0,
-            0,
-            &mut real_samples
-        ),
+        (descriptor.ring_consumer_render)(handle.as_ptr(), ptr::null_mut(), 0, &mut real_samples),
         RESULT_OK
     );
     assert_eq!(real_samples, 0);
     assert_eq!(
-        (descriptor.ring_consumer_render)(
-            handle.as_ptr(),
-            one.as_mut_ptr(),
-            1,
-            0,
-            0,
-            ptr::null_mut()
-        ),
+        (descriptor.ring_consumer_render)(handle.as_ptr(), one.as_mut_ptr(), 1, ptr::null_mut()),
         RESULT_INVALID_ARGUMENT
     );
     assert_eq!(
@@ -1259,8 +1709,6 @@ fn descriptor_operations_preserve_f32_and_account_for_renderer_shortfalls() {
             handle.as_ptr(),
             output.as_mut_ptr(),
             output.len() as u64,
-            0,
-            0,
             &mut real_samples
         ),
         RESULT_OK
@@ -1287,8 +1735,6 @@ fn descriptor_operations_preserve_f32_and_account_for_renderer_shortfalls() {
             handle.as_ptr(),
             output.as_mut_ptr(),
             output.len() as u64,
-            12,
-            8,
             &mut real_samples
         ),
         RESULT_OK
@@ -1304,8 +1750,6 @@ fn descriptor_operations_preserve_f32_and_account_for_renderer_shortfalls() {
             empty_handle.as_ptr(),
             concealed.as_mut_ptr(),
             concealed.len() as u64,
-            0,
-            0,
             &mut real_samples
         ),
         RESULT_OK
@@ -1338,7 +1782,7 @@ fn descriptor_reports_adapter_faults_after_safe_concealment() {
     let mut sample = 0.0;
     let mut real = true;
     assert_eq!(
-        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, 8, &mut real),
+        (descriptor.ring_consumer_render_sample)(handle.as_ptr(), &mut sample, &mut real),
         RESULT_ADAPTER_ERROR
     );
     assert!(!real);
@@ -1351,8 +1795,6 @@ fn descriptor_reports_adapter_faults_after_safe_concealment() {
             handle.as_ptr(),
             output.as_mut_ptr(),
             output.len() as u64,
-            0,
-            8,
             &mut real_samples
         ),
         RESULT_ADAPTER_ERROR

@@ -1,6 +1,6 @@
 //! Narrow runtime binding to the separately versioned sample-rate adapter.
 //!
-//! ADR 0022 deliberately keeps direct libsamplerate FFI out of the ring.  The
+//! ADR 0022 deliberately keeps direct resampler FFI out of the ring. The
 //! adapter descriptor is resolved once during ring construction and its
 //! persistent converter is used only by the sole consumer thereafter.
 
@@ -9,14 +9,14 @@ use core::mem::size_of;
 use core::ptr::{self, NonNull};
 
 /// ABI implemented by the separately versioned sample-rate adapter.
-const ADAPTER_ABI_VERSION: u32 = 1;
+const ADAPTER_ABI_VERSION: u32 = 2;
 /// Successful sample-rate adapter operation result.
 const ADAPTER_OK: c_int = 0;
 /// Capability required from the selected dynamic adapter.
 const REQUIRED_CAPABILITY: &[u8] = b"rptadv.samplerate\0";
 
 /// Adapter callback that creates one mono persistent converter.
-type ConverterCreate = unsafe extern "C" fn(c_int, u32, *mut *mut c_void) -> c_int;
+type ConverterCreate = unsafe extern "C" fn(u32, u32, u32, u32, *mut *mut c_void) -> c_int;
 /// Adapter callback that resets one stopped converter.
 type ConverterReset = unsafe extern "C" fn(*mut c_void) -> c_int;
 /// Adapter callback that processes bounded canonical F32 PCM.
@@ -32,8 +32,12 @@ type ConverterProcess = unsafe extern "C" fn(
 ) -> c_int;
 /// Adapter callback that destroys one stopped converter.
 type ConverterDestroy = unsafe extern "C" fn(*mut c_void);
+/// Adapter callback reporting queued input beyond the fixed filter delay.
+type ConverterQueuedInput = unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int;
+/// Adapter callback reporting the fixed FIR delay in output frames.
+type ConverterOutputDelay = unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int;
 
-/// C-compatible descriptor exported by `librptadv_samplerate_adapter.so.1`.
+/// C-compatible descriptor exported by `librptadv_samplerate_adapter.so.2`.
 #[repr(C)]
 pub(crate) struct AdapterDescriptor {
     pub(crate) struct_size: u32,
@@ -43,6 +47,8 @@ pub(crate) struct AdapterDescriptor {
     pub(crate) converter_reset: Option<ConverterReset>,
     pub(crate) converter_process: Option<ConverterProcess>,
     pub(crate) converter_destroy: Option<ConverterDestroy>,
+    pub(crate) converter_queued_input: Option<ConverterQueuedInput>,
+    pub(crate) converter_output_delay: Option<ConverterOutputDelay>,
 }
 
 // Descriptors are immutable function tables supplied by a loaded shared
@@ -57,12 +63,15 @@ pub(crate) struct AdapterFunctions {
     reset: ConverterReset,
     process: ConverterProcess,
     destroy: ConverterDestroy,
+    queued_input: ConverterQueuedInput,
+    output_delay: ConverterOutputDelay,
 }
 
 /// One persistent converter owned exclusively by a ring consumer.
 pub(crate) struct Converter {
     handle: NonNull<c_void>,
     functions: AdapterFunctions,
+    pub(crate) output_delay_samples: u32,
 }
 
 impl AdapterFunctions {
@@ -83,18 +92,29 @@ impl AdapterFunctions {
         let reset = descriptor.converter_reset.ok_or(())?;
         let process = descriptor.converter_process.ok_or(())?;
         let destroy = descriptor.converter_destroy.ok_or(())?;
+        let queued_input = descriptor.converter_queued_input.ok_or(())?;
+        let output_delay = descriptor.converter_output_delay.ok_or(())?;
         Ok(Self {
             create,
             reset,
             process,
             destroy,
+            queued_input,
+            output_delay,
         })
     }
 
     /// Create the preallocated converter outside the real-time path.
-    pub(crate) fn create_converter(self, quality: c_int) -> Result<Converter, ()> {
+    pub(crate) fn create_converter(
+        self,
+        input_rate: u32,
+        output_rate: u32,
+        max_input: u32,
+        max_output: u32,
+    ) -> Result<Converter, ()> {
         let mut handle = ptr::null_mut();
-        let result = unsafe { (self.create)(quality, 1, &mut handle) };
+        let result =
+            unsafe { (self.create)(input_rate, output_rate, max_input, max_output, &mut handle) };
         if result != ADAPTER_OK {
             return Err(());
         }
@@ -104,8 +124,14 @@ impl AdapterFunctions {
         let mut converter = Converter {
             handle,
             functions: self,
+            output_delay_samples: 0,
         };
         if converter.reset().is_err() {
+            return Err(());
+        }
+        let result =
+            unsafe { (self.output_delay)(handle.as_ptr(), &mut converter.output_delay_samples) };
+        if result != ADAPTER_OK {
             return Err(());
         }
         Ok(converter)
@@ -113,11 +139,22 @@ impl AdapterFunctions {
 }
 
 impl Converter {
-    /// Reset state while both endpoints are stopped.
+    /// Discard prior-burst history on the sole consumer endpoint.
     pub(crate) fn reset(&mut self) -> Result<(), ()> {
         let result = unsafe { (self.functions.reset)(self.handle.as_ptr()) };
         if result == ADAPTER_OK {
             Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Report accepted input still queued beyond fixed filter lookahead.
+    pub(crate) fn queued_input(&mut self) -> Result<u32, ()> {
+        let mut frames = 0;
+        let result = unsafe { (self.functions.queued_input)(self.handle.as_ptr(), &mut frames) };
+        if result == ADAPTER_OK {
+            Ok(frames)
         } else {
             Err(())
         }
@@ -130,7 +167,7 @@ impl Converter {
         output: &mut [f32],
         ratio: f64,
     ) -> Result<(usize, usize), ()> {
-        if input.is_empty() || output.is_empty() || !ratio.is_finite() || ratio <= 0.0 {
+        if output.is_empty() || !ratio.is_finite() || ratio <= 0.0 {
             return Err(());
         }
         // Ring creation bounds the input workspace to the adapter's u32 ABI;

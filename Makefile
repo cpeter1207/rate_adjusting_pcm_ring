@@ -21,9 +21,9 @@ PYTHON ?= python3
 CPPHECK_EXHAUSTIVE := $(shell $(CPPCHECK) --help 2>&1 | grep -q -- '--check-level' && printf '%s' '--check-level=exhaustive')
 
 PACKAGE := rate-adjusting-pcm-ring
-CRATE := rate_adjusting_pcm_ring2
-PACKAGE_VERSION ?= 2.0.0-alpha.4
-SOVERSION := 2
+CRATE := rate_adjusting_pcm_ring3
+PACKAGE_VERSION ?= 3.0.0-alpha.2
+SOVERSION := 3
 PREFIX ?= /usr/local
 DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib
@@ -34,22 +34,24 @@ TARGET_LIBRARY := $(TARGET_RELEASE)/$(LIBRARY_BASENAME).so
 LIBRARY_VERSIONED := build/$(LIBRARY_BASENAME).so.$(SOVERSION).$(PACKAGE_VERSION)
 LIBRARY_SONAME := build/$(LIBRARY_BASENAME).so.$(SOVERSION)
 LIBRARY_LINK := build/$(LIBRARY_BASENAME).so
-HEADER := include/rate_adjusting_pcm_ring2/rate_adjusting_pcm_ring2.h
+HEADER := include/rate_adjusting_pcm_ring3/rate_adjusting_pcm_ring3.h
 RUST_SOURCES := $(wildcard src/*.rs)
 RUST_PRODUCTION_SOURCES := $(filter-out src/tests.rs,$(RUST_SOURCES))
 RUST_DOXYGEN_INPUT := build/doxygen-input
 RUST_DOXYGEN_GENERATOR := tools/rust_to_doxygen.py
-PC_TEMPLATE := rate_adjusting_pcm_ring2.pc.in
-PC_FILE := build/rate_adjusting_pcm_ring2.pc
+PC_TEMPLATE := rate_adjusting_pcm_ring3.pc.in
+PC_FILE := build/rate_adjusting_pcm_ring3.pc
 C_SMOKE_SOURCE := tests/descriptor_smoke.c
 C_SMOKE_BINARY := build/descriptor-smoke
+C_INTEGRATION_SOURCE := tests/plc_integration.c
+C_INTEGRATION_BINARY := build/plc-integration
 DEBIAN_VERSION = $(shell dpkg-parsechangelog -S Version)
 DEBIAN_ARCH = $(shell dpkg-architecture -qDEB_HOST_ARCH)
 DEBIAN_MULTIARCH = $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 DEBIAN_SOURCE_PARENT = build/debian-source
 DEBIAN_OUTPUT_DIR = $(abspath $(DEBIAN_SOURCE_PARENT))
-DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring2_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
-DEBIAN_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring2-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_RUNTIME_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring3_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_DEV_DEB = $(DEBIAN_OUTPUT_DIR)/librate-adjusting-pcm-ring3-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_STAGE = build/debian-package-stage
 AUTOPKGTEST_DIR = build/autopkgtest
 # Use the project-owned Debian 13 quality base as an isolated package-test
@@ -104,15 +106,15 @@ quality: lint static-analysis docs
 
 lint:
 	$(CARGO_FMT) --check
-	$(CLANG_FORMAT) --dry-run --Werror $(HEADER) $(C_SMOKE_SOURCE)
+	$(CLANG_FORMAT) --dry-run --Werror $(HEADER) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE)
 	$(SHELLCHECK) tools/run-in-quality-container.sh debian/tests/install-check
 
 static-analysis:
 	RUSTFLAGS="-L native=$(SAMPLERATE_ADAPTER_LIBDIR)" $(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
 	$(PYTHON) -m py_compile $(RUST_DOXYGEN_GENERATOR)
 	$(CPPCHECK) $(CPPHECK_EXHAUSTIVE) --force --enable=warning,style,performance,portability \
-		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE)
-	$(CLANG_TIDY) $(C_SMOKE_SOURCE) --warnings-as-errors='*' -- $(C_WARNINGS) -Iinclude
+		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE)
+	$(CLANG_TIDY) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE) --warnings-as-errors='*' -- $(C_WARNINGS) -Iinclude
 
 docs: | build
 	rm -rf $(RUST_DOXYGEN_INPUT)
@@ -126,6 +128,13 @@ test: all
 		RUSTFLAGS="-L native=$(SAMPLERATE_ADAPTER_LIBDIR)" $(CARGO) test --all-targets --locked
 	$(MAKE) $(C_SMOKE_BINARY)
 	LD_LIBRARY_PATH="$(CURDIR)/build:$(SAMPLERATE_ADAPTER_LIBDIR):$$LD_LIBRARY_PATH" ./$(C_SMOKE_BINARY)
+	$(MAKE) $(C_INTEGRATION_BINARY)
+	LD_LIBRARY_PATH="$(CURDIR)/build:$(SAMPLERATE_ADAPTER_LIBDIR):$$LD_LIBRARY_PATH" ./$(C_INTEGRATION_BINARY)
+
+$(C_INTEGRATION_BINARY): $(C_INTEGRATION_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
+	$(CC) $(C_WARNINGS) -Iinclude $< -Lbuild -L$(SAMPLERATE_ADAPTER_LIBDIR) \
+		-l$(CRATE) -Wl,-rpath,'$$ORIGIN' \
+		-Wl,-rpath-link,$(SAMPLERATE_ADAPTER_LIBDIR) -o $@
 
 $(C_SMOKE_BINARY): $(C_SMOKE_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
 	$(CC) $(C_WARNINGS) -Iinclude $< -Lbuild -L$(SAMPLERATE_ADAPTER_LIBDIR) \
@@ -143,20 +152,23 @@ coverage:
 
 install: all $(PC_FILE)
 	install -d $(DESTDIR)$(LIBDIR) \
-		$(DESTDIR)$(PREFIX)/include/rate_adjusting_pcm_ring2 \
+		$(DESTDIR)$(PREFIX)/include/rate_adjusting_pcm_ring3 \
 		$(DESTDIR)$(LIBDIR)/pkgconfig
 	install -m 0755 $(LIBRARY_VERSIONED) $(DESTDIR)$(LIBDIR)/
 	ln -sf $(notdir $(LIBRARY_VERSIONED)) $(DESTDIR)$(LIBDIR)/$(notdir $(LIBRARY_SONAME))
 	ln -sf $(notdir $(LIBRARY_SONAME)) $(DESTDIR)$(LIBDIR)/$(notdir $(LIBRARY_LINK))
-	install -m 0644 $(HEADER) $(DESTDIR)$(PREFIX)/include/rate_adjusting_pcm_ring2/
+	install -m 0644 $(HEADER) $(DESTDIR)$(PREFIX)/include/rate_adjusting_pcm_ring3/
 	install -m 0644 $(PC_FILE) $(DESTDIR)$(LIBDIR)/pkgconfig/
 
 install-check: all
 	rm -rf build/stage
 	$(MAKE) PREFIX=$(CURDIR)/build/stage/usr LIBDIR=$(CURDIR)/build/stage/usr/lib install
 	test -z "$$(find build/stage/usr/lib -maxdepth 1 -name 'librate_adjusting_pcm_ring.so*' -print -quit)"
+	test -z "$$(find build/stage/usr/lib -maxdepth 1 -name 'librate_adjusting_pcm_ring2*' -print -quit)"
 	test ! -e build/stage/usr/include/rate_adjusting_pcm_ring/rate_adjusting_pcm_ring.h
 	test ! -e build/stage/usr/lib/pkgconfig/rate_adjusting_pcm_ring.pc
+	test ! -e build/stage/usr/include/rate_adjusting_pcm_ring2
+	test ! -e build/stage/usr/lib/pkgconfig/rate_adjusting_pcm_ring2.pc
 	test -f build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED))
 	test -L build/stage/usr/lib/$(notdir $(LIBRARY_SONAME))
 	test -L build/stage/usr/lib/$(notdir $(LIBRARY_LINK))
@@ -164,13 +176,17 @@ install-check: all
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
 		grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
 	$(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
-		grep -F 'librptadv_samplerate_adapter.so.1'
+		grep -F 'librptadv_samplerate_adapter.so.2'
 	! $(READELF) -d build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | grep -F 'libsamplerate.so'
-	test -f build/stage/usr/include/rate_adjusting_pcm_ring2/$(notdir $(HEADER))
-	test -f build/stage/usr/lib/pkgconfig/rate_adjusting_pcm_ring2.pc
+	$(READELF) --dyn-syms --wide build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
+		grep -E '[[:space:]]rpcr3_descriptor$$'
+	! $(READELF) --dyn-syms --wide build/stage/usr/lib/$(notdir $(LIBRARY_VERSIONED)) | \
+		grep -E '[[:space:]]rpcr2_descriptor$$'
+	test -f build/stage/usr/include/rate_adjusting_pcm_ring3/$(notdir $(HEADER))
+	test -f build/stage/usr/lib/pkgconfig/rate_adjusting_pcm_ring3.pc
 	PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig \
 		$(CC) $(C_WARNINGS) $(C_SMOKE_SOURCE) \
-		$$(PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig $(PKG_CONFIG) --cflags --libs rate_adjusting_pcm_ring2) \
+		$$(PKG_CONFIG_PATH=$(CURDIR)/build/stage/usr/lib/pkgconfig $(PKG_CONFIG) --cflags --libs rate_adjusting_pcm_ring3) \
 		-Wl,-rpath,$(CURDIR)/build/stage/usr/lib -Wl,-rpath,$(SAMPLERATE_ADAPTER_LIBDIR) \
 		-Wl,-rpath-link,$(SAMPLERATE_ADAPTER_LIBDIR) \
 		-o build/stage/descriptor-smoke
@@ -180,7 +196,7 @@ install-check: all
 adapter-debs:
 	test -n "$(SAMPLERATE_ADAPTER_DEB_DIR)"
 	test -d "$(SAMPLERATE_ADAPTER_DEB_DIR)"
-	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb' | wc -l)" -eq 1
+	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb' | wc -l)" -eq 1
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb' | wc -l)" -eq 1
 
 debian-package-check: dist adapter-debs
@@ -198,30 +214,40 @@ debian-package-check: dist adapter-debs
 	cp "$$build_root"/*.deb "$(DEBIAN_OUTPUT_DIR)/"
 	test -z "$$(find "$(DEBIAN_OUTPUT_DIR)" -maxdepth 1 -type f \
 		\( -name 'librate-adjusting-pcm-ring1_*.deb' -o \
-		-name 'librate-adjusting-pcm-ring-dev_*.deb' \) -print -quit)"
+		-name 'librate-adjusting-pcm-ring-dev_*.deb' -o \
+		-name 'librate-adjusting-pcm-ring2_*.deb' -o \
+		-name 'librate-adjusting-pcm-ring2-dev_*.deb' \) -print -quit)"
 	test -f "$(DEBIAN_RUNTIME_DEB)"
 	test -f "$(DEBIAN_DEV_DEB)"
 	rm -rf $(DEBIAN_STAGE)
 	mkdir -p $(DEBIAN_STAGE)
-	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb')" $(DEBIAN_STAGE)
+	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb')" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb')" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$(DEBIAN_RUNTIME_DEB)" $(DEBIAN_STAGE)
 	dpkg-deb --extract "$(DEBIAN_DEV_DEB)" $(DEBIAN_STAGE)
 	test -z "$$(find "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)" -maxdepth 1 \
 		-name 'librate_adjusting_pcm_ring.so*' -print -quit)"
+	test -z "$$(find "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)" -maxdepth 1 \
+		-name 'librate_adjusting_pcm_ring2*' -print -quit)"
 	test ! -e "$(DEBIAN_STAGE)/usr/include/rate_adjusting_pcm_ring/rate_adjusting_pcm_ring.h"
 	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig/rate_adjusting_pcm_ring.pc"
+	test ! -e "$(DEBIAN_STAGE)/usr/include/rate_adjusting_pcm_ring2"
+	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig/rate_adjusting_pcm_ring2.pc"
 	test ! -e "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).a"
 	test -L "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so"
-	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librptadv_samplerate_adapter.so.1"
+	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/librptadv_samplerate_adapter.so.2"
 	$(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
-		grep -F 'librptadv_samplerate_adapter.so.1'
+		grep -F 'librptadv_samplerate_adapter.so.2'
 	! $(READELF) -d "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | grep -F 'libsamplerate.so'
-	test -f "$(DEBIAN_STAGE)/usr/include/rate_adjusting_pcm_ring2/$(notdir $(HEADER))"
-	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig/rate_adjusting_pcm_ring2.pc"
+	$(READELF) --dyn-syms --wide "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
+		grep -E '[[:space:]]rpcr3_descriptor$$'
+	! $(READELF) --dyn-syms --wide "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).so.$(SOVERSION)" | \
+		grep -E '[[:space:]]rpcr2_descriptor$$'
+	test -f "$(DEBIAN_STAGE)/usr/include/rate_adjusting_pcm_ring3/$(notdir $(HEADER))"
+	test -f "$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig/rate_adjusting_pcm_ring3.pc"
 	PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig \
 		PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) $(CC) $(C_WARNINGS) $(C_SMOKE_SOURCE) \
-		$$(PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) $(PKG_CONFIG) --cflags --libs rate_adjusting_pcm_ring2) \
+		$$(PKG_CONFIG_PATH=$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/pkgconfig PKG_CONFIG_SYSROOT_DIR=$(CURDIR)/$(DEBIAN_STAGE) $(PKG_CONFIG) --cflags --libs rate_adjusting_pcm_ring3) \
 		-Wl,-rpath,$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH) \
 		-Wl,-rpath-link,$(CURDIR)/$(DEBIAN_STAGE)/usr/lib/$(DEBIAN_MULTIARCH) \
 		-o $(DEBIAN_STAGE)/descriptor-smoke
@@ -241,7 +267,7 @@ autopkgtest: debian-package-check adapter-debs
 	cleanup; \
 	trap 'status=$$?; cleanup; exit $$status' EXIT; \
 	$(AUTOPKGTEST) -U --output-dir $(AUTOPKGTEST_DIR) \
-		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb') \
+		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb') \
 		$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb') \
 		$(DEBIAN_RUNTIME_DEB) $(DEBIAN_DEV_DEB) . -- \
 		docker --no-init $(AUTOPKGTEST_TESTBED_IMAGE) \
@@ -256,16 +282,18 @@ dist: | build
 		--exclude='*/__pycache__' --exclude='*.pyc' \
 		--exclude=debian/.debhelper --exclude=debian/debhelper-build-stamp \
 		--exclude=debian/files --exclude=debian/tmp \
-		--exclude=debian/librate-adjusting-pcm-ring2 \
-		--exclude=debian/librate-adjusting-pcm-ring2-dev \
+		--exclude=debian/librate-adjusting-pcm-ring3 \
+		--exclude=debian/librate-adjusting-pcm-ring3-dev \
 		--exclude='debian/*.substvars' --exclude='debian/*.debhelper.log' \
 		--transform='s|^|$(PACKAGE)-$(PACKAGE_VERSION)/|' -czf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz \
 		AGENTS.md COPYING Cargo.lock Cargo.toml Doxyfile Makefile QUALITY.md README.md \
-		rate_adjusting_pcm_ring2.pc.in rust-toolchain.toml containers debian include src tests tools
+		rate_adjusting_pcm_ring3.pc.in rust-toolchain.toml containers debian include src tests tools
 
 distcheck: dist
 	! tar -tzf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz | \
-		grep -E '/debian/(\.debhelper/|debhelper-build-stamp$$|files$$|tmp/|librate-adjusting-pcm-ring(1|-dev|2|2-dev)/|.*\.(substvars|debhelper\.log)$$)'
+		grep -E '/debian/(\.debhelper/|debhelper-build-stamp$$|files$$|tmp/|librate-adjusting-pcm-ring(1|-dev|2|2-dev|3|3-dev)/|.*\.(substvars|debhelper\.log)$$)'
+	! tar -tzf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz | \
+		grep -E '/(include/rate_adjusting_pcm_ring2/|rate_adjusting_pcm_ring2\.pc\.in$$|debian/librate-adjusting-pcm-ring2(-dev)?\.(install|docs)$$)'
 	! tar -tzf build/$(PACKAGE)-$(PACKAGE_VERSION).tar.gz | \
 		grep -E '/(rate_adjusting_pcm_ring\.pc\.in|src/(legacy_bridge(/tests)?\.rs|rate_adjusting_pcm_ring\.c)|include/rate_adjusting_pcm_ring\.h|tests/test_(ring|consumer)\.c|debian/librate-adjusting-pcm-ring(1|-dev)\.(install|docs))$$'
 	rm -rf build/dist-unpacked
@@ -281,7 +309,7 @@ ci: quality platform-verify
 quality-image:
 	test -n "$(SAMPLERATE_ADAPTER_DEB_DIR)"
 	test -d "$(SAMPLERATE_ADAPTER_DEB_DIR)"
-	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter1_*.deb' | wc -l)" -eq 1
+	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter2_*.deb' | wc -l)" -eq 1
 	test "$$(find "$(SAMPLERATE_ADAPTER_DEB_DIR)" -maxdepth 1 -type f -name 'librptadv-samplerate-adapter-dev_*.deb' | wc -l)" -eq 1
 	docker image pull $(QUALITY_BASE_IMAGE)
 	test "$(AUTOPKGTEST_TESTBED_IMAGE)" = "$(QUALITY_BASE_IMAGE)" || \
