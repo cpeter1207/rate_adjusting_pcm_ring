@@ -14,6 +14,6 @@ jobs:
     with:
       code_ref: ${{ github.sha }}
       tag: ${{ github.ref_name }}
-      samplerate_adapter_tag: v0.1.0-alpha.3
+      samplerate_adapter_tag: v0.2.0-alpha1
     secrets:
       APT_INDEX_DISPATCH_TOKEN: ${{ secrets.APT_INDEX_DISPATCH_TOKEN }}
