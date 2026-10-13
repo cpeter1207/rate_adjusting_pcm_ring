@@ -1,3 +1,11 @@
+rate-adjusting-pcm-ring (3.0.0~alpha3-1) unstable; urgency=medium
+
+  * Append counted, ordered missing-source spans to the ABI3 descriptor.
+  * Map gaps through the persistent converter and conceal only in ring PLC.
+  * Require the compatible samplerate adapter live-position extension.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Tue, 13 Oct 2026 12:00:00 -0500
+
 rate-adjusting-pcm-ring (3.0.0~alpha2-1) unstable; urgency=medium
 
   * Keep ring ABI 3 and use samplerate adapter ABI 2 with libswresample.

@@ -71,10 +71,236 @@ const ERROR: c_int = -1;
 const CAPABILITY_NAME: &[u8] = b"rptadv.samplerate\0";
 const WRONG_CAPABILITY_NAME: &[u8] = b"test.samplerate-adapter\0";
 
+#[test]
+fn counted_gaps_keep_position_between_already_buffered_pcm() {
+    let table = descriptor();
+    assert!(
+        table.struct_size >= 96,
+        "counted-gap descriptor tail missing"
+    );
+    let gap = unsafe {
+        (table as *const Descriptor)
+            .cast::<u8>()
+            .add(88)
+            .cast::<extern "C" fn(*mut Rpcr3Ring, u64, *mut u64) -> c_int>()
+            .read()
+    };
+    let handle = handle_with(adapter(&FAKE_DESCRIPTOR));
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push(&[0.5; 40]), 40);
+    let mut accepted = 99;
+    assert_eq!(gap(handle.as_ptr(), 17, &mut accepted), RESULT_OK);
+    assert_eq!(accepted, 17);
+    assert_eq!(ring.producer_push(&[-0.5; 40]), 40);
+    for index in 0..97 {
+        let (sample, real, failed) = ring.consumer_render_sample();
+        assert!(!failed);
+        assert_eq!(real, !(40..57).contains(&index), "output {index}");
+        assert_eq!(
+            sample,
+            if index < 40 {
+                0.5
+            } else if index < 57 {
+                0.0
+            } else {
+                -0.5
+            }
+        );
+    }
+    assert_eq!(ring.observe().missing_samples, 17);
+}
+
 thread_local! {
     static FAIL_BYTES: Cell<usize> = const { Cell::new(0) };
     static FAIL_AFTER: Cell<usize> = const { Cell::new(1) };
     static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[test]
+fn counted_gaps_validate_bounds_and_retry_only_the_unaccepted_suffix() {
+    let handle = fake_handle();
+    let pointer = handle.as_ptr();
+    let ring = unsafe { &(*pointer).ring };
+    let gap = descriptor().ring_producer_gap;
+    let mut accepted = 99;
+    assert_eq!(
+        gap(ptr::null_mut(), 1, &mut accepted),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(gap(pointer, 1, ptr::null_mut()), RESULT_INVALID_ARGUMENT);
+    assert_eq!(gap(pointer, 513, &mut accepted), RESULT_INVALID_ARGUMENT);
+    assert_eq!(accepted, 99);
+    assert_eq!(gap(pointer, 0, &mut accepted), RESULT_OK);
+    assert_eq!(accepted, 0);
+    // Exercise nonempty output cache, partial gap admission, repeated gaps,
+    // cursor wrap and metadata reuse over more than two FIFO laps.
+    for _ in 0..8 {
+        assert_eq!(ring.producer_push(&[0.25; 510]), 510);
+        assert_eq!(gap(pointer, 7, &mut accepted), RESULT_OK);
+        assert_eq!(accepted, 2);
+        assert_eq!(ring.consumer_render_sample(), (0.25, true, false));
+        assert_eq!(gap(pointer, 5, &mut accepted), RESULT_OK);
+        assert_eq!(accepted, 5);
+        assert_eq!(gap(pointer, 3, &mut accepted), RESULT_OK);
+        assert_eq!(accepted, 3);
+        assert_eq!(ring.producer_push(&[-0.25; 12]), 12);
+        for _ in 1..510 {
+            assert_eq!(ring.consumer_render_sample(), (0.25, true, false));
+        }
+        for _ in 0..10 {
+            assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+        }
+        for _ in 0..12 {
+            assert_eq!(ring.consumer_render_sample(), (-0.25, true, false));
+        }
+    }
+    assert_eq!(ring.observe().missing_samples, 80);
+    assert_eq!(ring.observe().discarded_samples, 40);
+    assert_eq!(ring.producer_gap(30), 30);
+    assert_eq!(ring.consumer_reset(), Ok(()));
+    assert_eq!(ring.producer_push(&[0.125; 40]), 40);
+    for _ in 0..40 {
+        assert_eq!(ring.consumer_render_sample(), (0.125, true, false));
+    }
+}
+
+#[test]
+fn counted_gaps_reach_existing_plc_once_without_runtime_allocation() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 40,
+            target: 160,
+            max_producer: 160,
+            max_output: 32,
+            plc: PlcMode::G711AppendixI,
+            ..settings(2048, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    let mut reference = crate::plc::Plc::new(8000).unwrap();
+    let tone: Vec<f32> = (0..160).map(|i| (i as f32 * 0.2).sin() * 0.5).collect();
+    let before = ALLOCATION_COUNT.get();
+    assert_eq!(ring.producer_push(&tone), 160);
+    assert_eq!(ring.producer_gap(80), 80);
+    assert_eq!(ring.producer_push(&tone), 160);
+    for index in 0..440 {
+        let input = match index {
+            0..160 => Some(tone[index]),
+            240..400 => Some(tone[index - 240]),
+            _ => None,
+        };
+        let expected = reference.process(input);
+        let (sample, real, failed) = ring.consumer_render_sample();
+        assert!(!failed);
+        assert_eq!((sample, real), expected, "output {index}");
+    }
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+    assert_eq!(ring.observe().missing_samples, 120);
+}
+
+#[test]
+fn live_position_tail_is_required_and_query_failures_are_reported() {
+    let missing = AdapterDescriptor {
+        converter_input_delay: None,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&missing) }.is_err());
+    let old_prefix = AdapterDescriptor {
+        struct_size: 64,
+        ..FAKE_DESCRIPTOR
+    };
+    assert!(unsafe { AdapterFunctions::from_descriptor(&old_prefix) }.is_err());
+    unsafe extern "C" fn invalid(_converter: *mut c_void, delay: *mut i64) -> c_int {
+        unsafe { *delay = -1 };
+        OK
+    }
+    assert!(matches!(
+        Ring::create(
+            settings(512, 8000, 8000),
+            adapter(&AdapterDescriptor {
+                converter_input_delay: Some(invalid),
+                ..FAKE_DESCRIPTOR
+            })
+        ),
+        Err(CreateError::Adapter)
+    ));
+    thread_local! { static FAIL_DELAY: Cell<bool> = const { Cell::new(false) }; }
+    unsafe extern "C" fn fail_when_requested(_converter: *mut c_void, delay: *mut i64) -> c_int {
+        if FAIL_DELAY.get() {
+            ERROR
+        } else {
+            unsafe { *delay = 0 };
+            OK
+        }
+    }
+    let ring = Ring::create(
+        settings(512, 8000, 8000),
+        adapter(&AdapterDescriptor {
+            converter_input_delay: Some(fail_when_requested),
+            ..FAKE_DESCRIPTOR
+        }),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_gap(2), 2);
+    FAIL_DELAY.set(true);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.observe().adapter_error_count, 1);
+    FAIL_DELAY.set(false);
+    assert_eq!(ring.consumer_reset(), Ok(()));
+}
+
+#[test]
+fn real_converter_places_successive_gaps_at_nominal_output_boundaries() {
+    for rate in [8000, 48000] {
+        for partition in [1, 13, 256] {
+            let ring =
+                Ring::create(settings(2048, rate, 48000), load_functions().unwrap()).unwrap();
+            assert_eq!(ring.producer_push(&[0.5; 80]), 80);
+            // Generate and retain an output cache before publishing the gap.
+            assert!(!ring.consumer_render_sample().2);
+            assert_eq!(ring.producer_gap(17), 17);
+            assert_eq!(ring.producer_push(&[-0.5; 37]), 37);
+            assert_eq!(ring.producer_gap(19), 19);
+            assert_eq!(ring.producer_gap(1), 1);
+            assert_eq!(ring.producer_push(&[0.25; 900]), 900);
+            let factor = 48000 / rate;
+            let delay = ring.output_delay_samples() as usize;
+            let intervals = [
+                (delay + 80 * factor as usize, 17 * factor as usize),
+                (delay + 134 * factor as usize, 20 * factor as usize),
+            ];
+            let mut missing = Vec::new();
+            for index in 1..(delay + 220 * factor as usize) {
+                let (_, real, failed) = ring.consumer_render_sample();
+                assert!(!failed);
+                if !real {
+                    missing.push(index);
+                }
+                // Partition the producer's later PCM independently from source
+                // spans, keeping following data available through the FIR.
+                if index % (factor as usize * 100) == 0 {
+                    ring.producer_push(&vec![0.25; partition]);
+                }
+            }
+            assert_eq!(
+                missing.len(),
+                37 * factor as usize,
+                "rate {rate}, partition {partition}"
+            );
+            let mut offset = 0;
+            for (start, length) in intervals {
+                assert!(
+                    missing[offset].abs_diff(start) <= 1,
+                    "{rate}: {:?}",
+                    missing
+                );
+                assert_eq!(missing[offset + length - 1] - missing[offset] + 1, length);
+                offset += length;
+            }
+            assert_eq!(ring.observe().missing_samples, missing.len() as u64);
+        }
+    }
 }
 struct Allocator;
 
@@ -206,6 +432,11 @@ unsafe extern "C" fn fake_queued_input(_converter: *mut c_void, frames: *mut u32
     OK
 }
 
+unsafe extern "C" fn fake_input_delay(_converter: *mut c_void, delay: *mut i64) -> c_int {
+    unsafe { *delay = 0 };
+    OK
+}
+
 unsafe extern "C" fn fake_destroy(converter: *mut c_void) {
     if !converter.is_null() {
         unsafe {
@@ -224,6 +455,7 @@ pub(crate) static FAKE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 unsafe extern "C" fn failing_process(
@@ -302,6 +534,7 @@ pub(crate) static FAILING_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 pub(crate) static ZERO_PROGRESS_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -314,6 +547,7 @@ pub(crate) static ZERO_PROGRESS_DESCRIPTOR: AdapterDescriptor = AdapterDescripto
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static CONSUME_ONE_ZERO_OUTPUT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -326,6 +560,7 @@ static CONSUME_ONE_ZERO_OUTPUT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static WRONG_CAPABILITY_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -338,6 +573,7 @@ static WRONG_CAPABILITY_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 unsafe extern "C" fn create_fails(
@@ -414,6 +650,7 @@ pub(crate) static CREATE_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescript
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static NULL_HANDLE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -426,6 +663,7 @@ static NULL_HANDLE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static RESET_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -438,6 +676,7 @@ static RESET_FAILURE_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static INVALID_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -450,6 +689,7 @@ static INVALID_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 static INVALID_OUTPUT_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
@@ -462,6 +702,7 @@ static INVALID_OUTPUT_COUNT_DESCRIPTOR: AdapterDescriptor = AdapterDescriptor {
     converter_destroy: Some(fake_destroy),
     converter_queued_input: Some(fake_queued_input),
     converter_output_delay: Some(fake_queued_input),
+    converter_input_delay: Some(fake_input_delay),
 };
 
 pub(crate) fn adapter(descriptor: &AdapterDescriptor) -> AdapterFunctions {
@@ -951,7 +1192,7 @@ fn construction_handles_control_plane_allocation_failure_without_panicking() {
     assert!(matches!(too_large, Err(CreateError::Invalid)));
     assert!(allocate_samples(usize::MAX).is_err());
 
-    for occurrence in 1..=3 {
+    for occurrence in 1..=2 {
         let no_memory = fail_allocation_at(512 * size_of::<f32>(), occurrence, || {
             Ring::create(settings(512, 8_000, 8_000), adapter(&FAKE_DESCRIPTOR))
         });
@@ -1102,6 +1343,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&undersized) }.is_err());
 
@@ -1115,6 +1357,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&incompatible_abi) }.is_err());
 
@@ -1128,6 +1371,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_capability) }.is_err());
 
@@ -1141,6 +1385,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_create) }.is_err());
 
@@ -1154,6 +1399,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_reset) }.is_err());
 
@@ -1167,6 +1413,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: Some(fake_destroy),
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_process) }.is_err());
 
@@ -1180,6 +1427,7 @@ fn adapter_validation_rejects_each_required_descriptor_component() {
         converter_destroy: None,
         converter_queued_input: Some(fake_queued_input),
         converter_output_delay: Some(fake_queued_input),
+        converter_input_delay: Some(fake_input_delay),
     };
     assert!(unsafe { AdapterFunctions::from_descriptor(&missing_destroy) }.is_err());
 

@@ -12,6 +12,40 @@ fn ring(capacity: usize) -> Ring {
 }
 
 #[test]
+fn tagged_source_and_gap_metadata_allocation_failures_are_recoverable() {
+    for bytes in [512 * size_of::<SourceSample>(), 1026 * size_of::<GapSpan>()] {
+        let result = crate::tests::fail_allocation_at(bytes, 1, || {
+            Ring::create(
+                crate::tests::settings(512, 8000, 8000),
+                unsafe { AdapterFunctions::from_descriptor(&FAKE_DESCRIPTOR) }.unwrap(),
+            )
+        });
+        assert!(matches!(result, Err(CreateError::NoMemory)));
+    }
+}
+
+#[test]
+fn exhausted_gap_metadata_reports_a_fault_without_allocating() {
+    let ring = ring(512);
+    {
+        let state = unsafe { &mut *ring.consumer.get() };
+        // A provider retaining beyond its declared queue bound must not make
+        // the consumer grow its metadata storage on an audio callback.
+        for index in 0..state.gaps.capacity() {
+            state.gaps.push_back(GapSpan {
+                start: index as u128 * 2,
+                end: index as u128 * 2 + 1,
+            });
+        }
+    }
+    assert_eq!(ring.producer_gap(1), 1);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.consumer_reset(), Ok(()));
+    assert!(ring.producer_push_sample(0.5));
+    assert_eq!(ring.consumer_render_sample(), (0.5, true, false));
+}
+
+#[test]
 fn non_power_of_two_cursor_wrap_preserves_unread_pcm() {
     let ring = ring(513);
     ring.written.store(1_024, Ordering::Relaxed);
@@ -23,11 +57,72 @@ fn non_power_of_two_cursor_wrap_preserves_unread_pcm() {
         assert!(!ring.producer_push_sample(-0.5));
         assert!(ring.written.load(Ordering::Relaxed) < 1_026);
         for &expected in &input {
-            assert_eq!(ring.consumer_take_source_sample(), Some(expected));
+            assert_eq!(
+                ring.consumer_take_source_sample(),
+                Some(SourceSample {
+                    pcm: expected,
+                    missing: false
+                })
+            );
         }
         assert_eq!(ring.consumer_take_source_sample(), None);
         assert_eq!(ring.available(), 0);
         assert!(ring.read.load(Ordering::Relaxed) < 1_026);
+    }
+}
+
+#[test]
+fn real_gap_mapping_survives_partial_adapter_input_wrap_and_ppm_changes() {
+    for rate in [8000, 48000] {
+        for correction in [0.999, 1.0, 1.001] {
+            let ring = Ring::create(
+                crate::tests::settings(513, rate, 48000),
+                crate::samplerate_adapter::load_functions().unwrap(),
+            )
+            .unwrap();
+            let intervals = [(80, 97), (480, 540), (900, 905), (1024, 1104)];
+            let mut source = 0;
+            let mut missing = 0;
+            let mut saw_pending = false;
+            let mut saw_converter_backlog = false;
+            let nominal = 48000.0 / f64::from(rate);
+            let frames = (1500.0 * nominal) as usize;
+            for index in 0..frames {
+                // Keep following PCM available; producer publications wrap the
+                // non-power-of-two FIFO while SWR retains accepted history.
+                while source < 2000 && ring.available() < 513 {
+                    let is_gap = intervals
+                        .iter()
+                        .any(|&(start, end)| (start..end).contains(&source));
+                    assert!(if is_gap {
+                        ring.producer_gap(1) == 1
+                    } else {
+                        ring.producer_push_sample(0.5)
+                    });
+                    source += 1;
+                }
+                {
+                    let state = unsafe { &mut *ring.consumer.get() };
+                    state.ratio = nominal * correction;
+                    saw_pending |= state.input_pending != 0;
+                    saw_converter_backlog |= state.converter.queued_input().unwrap() != 0;
+                }
+                let (_, real, failed) = ring.consumer_render_sample();
+                assert!(
+                    !failed,
+                    "rate={rate}, correction={correction}, output={index}"
+                );
+                missing += usize::from(!real);
+            }
+            let expected = 162.0 * nominal * correction;
+            assert!(
+                (missing as f64 - expected).abs() <= 4.0,
+                "rate={rate}, correction={correction}: missing={missing}, expected={expected}"
+            );
+            assert!(saw_pending);
+            assert!(saw_converter_backlog);
+            assert!(unsafe { &*ring.consumer.get() }.gaps.is_empty());
+        }
     }
 }
 
@@ -50,7 +145,13 @@ fn concurrent_spsc_preserves_pcm_across_cursor_wraps() {
             }
             thread::yield_now();
         };
-        assert_eq!(actual, index as f32 / 10_000.0);
+        assert_eq!(
+            actual,
+            SourceSample {
+                pcm: index as f32 / 10_000.0,
+                missing: false
+            }
+        );
     }
     worker.join().unwrap();
     assert_eq!(ring.available(), 0);

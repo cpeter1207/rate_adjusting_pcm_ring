@@ -36,6 +36,8 @@ type ConverterDestroy = unsafe extern "C" fn(*mut c_void);
 type ConverterQueuedInput = unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int;
 /// Adapter callback reporting the fixed FIR delay in output frames.
 type ConverterOutputDelay = unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int;
+/// Adapter callback reporting live delay in billionths of a source frame.
+type ConverterInputDelay = unsafe extern "C" fn(*mut c_void, *mut i64) -> c_int;
 
 /// C-compatible descriptor exported by `librptadv_samplerate_adapter.so.2`.
 #[repr(C)]
@@ -49,6 +51,7 @@ pub(crate) struct AdapterDescriptor {
     pub(crate) converter_destroy: Option<ConverterDestroy>,
     pub(crate) converter_queued_input: Option<ConverterQueuedInput>,
     pub(crate) converter_output_delay: Option<ConverterOutputDelay>,
+    pub(crate) converter_input_delay: Option<ConverterInputDelay>,
 }
 
 // Descriptors are immutable function tables supplied by a loaded shared
@@ -65,6 +68,7 @@ pub(crate) struct AdapterFunctions {
     destroy: ConverterDestroy,
     queued_input: ConverterQueuedInput,
     output_delay: ConverterOutputDelay,
+    input_delay: ConverterInputDelay,
 }
 
 /// One persistent converter owned exclusively by a ring consumer.
@@ -77,11 +81,17 @@ pub(crate) struct Converter {
 impl AdapterFunctions {
     /// Validate an adapter descriptor before any real-time operation begins.
     pub(crate) unsafe fn from_descriptor(descriptor: *const AdapterDescriptor) -> Result<Self, ()> {
-        let descriptor = unsafe { descriptor.as_ref() }.ok_or(())?;
-        if descriptor.struct_size < size_of::<AdapterDescriptor>() as u32
-            || descriptor.abi_version != ADAPTER_ABI_VERSION
-            || descriptor.capability_name.is_null()
+        let pointer = NonNull::new(descriptor.cast_mut()).ok_or(())?.as_ptr();
+        // Old ABI2 providers may expose only the prefix: inspect its size
+        // before forming a reference that includes the compatible tail.
+        if unsafe { ptr::addr_of!((*pointer).struct_size).read() }
+            < size_of::<AdapterDescriptor>() as u32
+            || unsafe { ptr::addr_of!((*pointer).abi_version).read() } != ADAPTER_ABI_VERSION
         {
+            return Err(());
+        }
+        let descriptor = unsafe { &*pointer };
+        if descriptor.capability_name.is_null() {
             return Err(());
         }
         let capability = unsafe { CStr::from_ptr(descriptor.capability_name) };
@@ -94,6 +104,7 @@ impl AdapterFunctions {
         let destroy = descriptor.converter_destroy.ok_or(())?;
         let queued_input = descriptor.converter_queued_input.ok_or(())?;
         let output_delay = descriptor.converter_output_delay.ok_or(())?;
+        let input_delay = descriptor.converter_input_delay.ok_or(())?;
         Ok(Self {
             create,
             reset,
@@ -101,6 +112,7 @@ impl AdapterFunctions {
             destroy,
             queued_input,
             output_delay,
+            input_delay,
         })
     }
 
@@ -139,6 +151,17 @@ impl AdapterFunctions {
 }
 
 impl Converter {
+    /// Include buffered PCM and fractional FIR phase in source-position mapping.
+    pub(crate) fn input_delay(&mut self) -> Result<i64, ()> {
+        let mut delay = 0;
+        let result = unsafe { (self.functions.input_delay)(self.handle.as_ptr(), &mut delay) };
+        if result == ADAPTER_OK && delay >= 0 {
+            Ok(delay)
+        } else {
+            Err(())
+        }
+    }
+
     /// Discard prior-burst history on the sole consumer endpoint.
     pub(crate) fn reset(&mut self) -> Result<(), ()> {
         let result = unsafe { (self.functions.reset)(self.handle.as_ptr()) };

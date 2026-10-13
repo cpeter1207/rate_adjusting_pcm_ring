@@ -93,6 +93,8 @@ type ConsumerReset = extern "C" fn(*mut Rpcr3Ring) -> c_int;
 type Observe = extern "C" fn(*const Rpcr3Ring, *mut CObservation) -> c_int;
 /// C function type reporting the immutable intrinsic output delay.
 type OutputDelay = extern "C" fn(*const Rpcr3Ring, *mut u64) -> c_int;
+/// C function type publishing a counted missing-source span.
+type ProducerGap = extern "C" fn(*mut Rpcr3Ring, u64, *mut u64) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -109,6 +111,7 @@ pub struct Descriptor {
     ring_consumer_reset: ConsumerReset,
     ring_observe: Observe,
     ring_output_delay: OutputDelay,
+    ring_producer_gap: ProducerGap,
 }
 
 // The descriptor contains immutable data and function pointers valid for the
@@ -298,6 +301,22 @@ extern "C" fn ring_producer_push(
     RESULT_OK
 }
 
+/// Publish a counted gap with the same bounded prefix admission as PCM.
+extern "C" fn ring_producer_gap(ring: *mut Rpcr3Ring, samples: u64, accepted: *mut u64) -> c_int {
+    let Some(accepted) = NonNull::new(accepted) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let ring = match unsafe { checked_ring(ring) } {
+        Ok(ring) => ring,
+        Err(error) => return error,
+    };
+    if samples > ring.ring.max_producer_samples() as u64 {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    unsafe { *accepted.as_ptr() = ring.ring.producer_gap(samples) };
+    RESULT_OK
+}
+
 /// Render one output sample and report whether it came from converted source PCM.
 extern "C" fn ring_consumer_render_sample(
     ring: *mut Rpcr3Ring,
@@ -430,6 +449,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_consumer_reset,
     ring_observe,
     ring_output_delay,
+    ring_producer_gap,
 };
 
 /// Return the immutable ABI-major-3 descriptor for the Rust ring.

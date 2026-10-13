@@ -140,10 +140,11 @@ struct rpcr3_observation {
   uint32_t reserved;
   /** Producer samples rejected because unread input storage was full. */
   uint64_t discarded_samples;
-  /** Output-rate converter shortfalls, excluding priming and PLC delay silence.
+  /** Mapped gaps and output-rate converter shortfalls, excluding priming and
+   * PLC delay silence.
    */
   uint64_t missing_samples;
-  /** Current contiguous converter-shortfall run in output samples. */
+  /** Current contiguous missing-output run, including mapped source gaps. */
   uint64_t consecutive_shortfall_samples;
   /** Ten-second consecutive-shortfall moving average in millisamples. */
   uint64_t shortfall_average_milli;
@@ -267,7 +268,35 @@ struct rpcr3_descriptor {
    */
   enum rpcr3_result (*ring_output_delay)(const struct rpcr3_ring *ring,
                                          uint64_t *samples);
+  /**
+   * @brief Append a counted missing-source span at the current producer
+   * position.
+   * @param ring Ring with exactly one active producer, serialized with PCM
+   * writes.
+   * @param input_samples Missing input-rate samples, within the producer
+   * maximum.
+   * @param accepted Destination for the accepted chronological prefix length.
+   * @return One @ref rpcr3_result value. Invalid arguments change nothing.
+   *
+   * Compatible descriptor extension introduced in 3.0.0-alpha.3. Check the
+   * gap minimum size before accessing this tail. Accepted gaps occupy FIFO
+   * slots like PCM; retry an unaccepted suffix before publishing later PCM.
+   * Gaps remain between older and following PCM through the persistent FIR
+   * and clock compensation. Internal zero placeholders are never classified
+   * as real output. Each mapped output is concealed once by the ring's selected
+   * PLC (or silence when disabled). Source boundaries use the adapter's live
+   * position quantized to billionths of a source frame, then floored; an exact
+   * boundary belongs to the following span. Reset discards pending gaps.
+   */
+  enum rpcr3_result (*ring_producer_gap)(struct rpcr3_ring *ring,
+                                         uint64_t input_samples,
+                                         uint64_t *accepted);
 };
+
+/** Readable prefix required before calling the counted-gap descriptor tail. */
+#define RPCR3_DESCRIPTOR_GAP_MIN_SIZE                                          \
+  (offsetof(struct rpcr3_descriptor, ring_producer_gap) +                      \
+   sizeof(((struct rpcr3_descriptor *)0)->ring_producer_gap))
 
 /**
  * @brief Return the immutable ABI-major-3 ring descriptor.

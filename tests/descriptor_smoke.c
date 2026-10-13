@@ -14,6 +14,10 @@ _Static_assert(offsetof(struct rpcr3_config, reserve_samples) == 24,
                "ABI-3 reserve offset");
 _Static_assert(offsetof(struct rpcr3_config, plc_mode) == 56,
                "ABI-3 mode offset");
+_Static_assert(offsetof(struct rpcr3_descriptor, ring_output_delay) == 80,
+               "preserved ABI-3 prefix");
+_Static_assert(offsetof(struct rpcr3_descriptor, ring_producer_gap) == 88,
+               "compatible ABI-3 gap tail");
 
 int main(void) {
   const struct rpcr3_descriptor *descriptor = rpcr3_descriptor();
@@ -50,6 +54,8 @@ int main(void) {
   assert(descriptor->ring_consumer_reset != NULL);
   assert(descriptor->ring_observe != NULL);
   assert(descriptor->ring_output_delay != NULL);
+  assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_GAP_MIN_SIZE);
+  assert(descriptor->ring_producer_gap != NULL);
   assert(descriptor->ring_create(&config, NULL) == RPCR3_INVALID_ARGUMENT);
   assert(descriptor->ring_create(NULL, &ring) == RPCR3_INVALID_ARGUMENT);
   assert(ring == NULL);
@@ -87,6 +93,12 @@ int main(void) {
     assert(short_observation == sizeof(short_observation));
 
     uint64_t accepted = 17;
+    assert(descriptor->ring_producer_gap(ring, 161, &accepted) ==
+           RPCR3_INVALID_ARGUMENT);
+    assert(accepted == 17);
+    assert(descriptor->ring_producer_gap(ring, 0, &accepted) == RPCR3_OK);
+    assert(accepted == 0);
+    accepted = 17;
     assert(descriptor->ring_producer_push(ring, (const float *)(uintptr_t)1,
                                           161,
                                           &accepted) == RPCR3_INVALID_ARGUMENT);
