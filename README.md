@@ -35,6 +35,25 @@ provide trailing padding before retaining exactly the source duration. This
 read-only callback is appended compatibly to the ABI-3 descriptor in
 3.0.0-alpha.2; callers must validate its `struct_size` before using it.
 
+`ring_producer_gap` (3.0.0-alpha.3) appends a counted missing interval in input
+samples. Check `RPCR3_DESCRIPTOR_GAP_MIN_SIZE` before using this compatible
+descriptor tail. Gaps occupy FIFO capacity and obey the same producer maximum,
+prefix acceptance, discard accounting, and chronological retry rule as PCM.
+They remain ordered between older buffered PCM and following PCM, even inside
+converter input, FIR history, or a pending output cache. Reset discards them.
+
+The consumer feeds internal zero placeholders through the same persistent
+converter to preserve source time and FIR phase, then maps generated output
+to the tagged source intervals. It queries live delay in billionths of a source
+frame immediately before one-output conversions while gaps are pending; the
+quantized source position is floored, so an exact boundary belongs to the next
+span. The adapter rounds to nearest with at most half a billionth of a source
+frame error. Each mapped missing output reaches the existing PLC exactly once
+(or silence in disabled mode), never as real PCM. `missing_samples` includes
+these outputs as well as actual converter shortfalls. No-gap rendering retains
+the ordinary batched converter path. Marker storage is bounded and allocated
+at construction; neither endpoint allocates or locks while streaming.
+
 ## Public ABI
 
 ABI major three is the canonical-F32 interface:
@@ -53,7 +72,7 @@ prefix and configuration layout. Consumers must convert boundary PCM to canonica
 
 ## Build and verify
 
-Install `librptadv-samplerate-adapter-dev` version `0.2.0~alpha1` or newer, then run:
+Install `librptadv-samplerate-adapter-dev` version `0.2.0~alpha2` or newer, then run:
 
 ```sh
 make
@@ -87,6 +106,19 @@ vendoring its source. Give their directory explicitly:
 ```sh
 make SAMPLERATE_ADAPTER_DEB_DIR=/path/to/adapter-debs quality-image
 ```
+
+## Release order
+
+Release `rptadv-samplerate-adapter` `v0.2.0-alpha2` first, including both
+Debian 13 architecture packages. Pin that release's merged commit in
+`.github/dependencies.json`; keep the same tag in
+the ring quality and release workflows. Open a ring pull request and wait for
+its full required quality gate, including native amd64/arm64 jobs, before
+merging. Tag the validated main commit `v3.0.0-alpha3` to publish this ABI-3
+extension. Confirm the GitHub release contains both architecture archives,
+runtime and development Debian packages, and the source archive; then confirm
+the package index was refreshed for both dependency releases. A source push
+alone is not a release, and this procedure does not install anything on a node.
 
 ## Install
 

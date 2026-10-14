@@ -7,6 +7,7 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::collections::VecDeque;
 
 use crate::plc::Plc;
 use crate::samplerate_adapter::{AdapterFunctions, Converter};
@@ -116,9 +117,9 @@ pub(crate) struct Observation {
     pub(crate) ratio_correction_ppm: i32,
     /// Input samples rejected because unread storage was full.
     pub(crate) discarded_samples: u64,
-    /// Converter shortfalls, excluding intentional priming and PLC lookahead.
+    /// Mapped gaps and converter shortfalls, excluding priming and PLC lookahead.
     pub(crate) missing_samples: u64,
-    /// Current consecutive converter-shortfall run in output samples.
+    /// Current consecutive missing-output run, including mapped source gaps.
     pub(crate) consecutive_shortfall_samples: u64,
     /// Ten-second moving average of consecutive shortfall in millisamples.
     pub(crate) shortfall_average_milli: u64,
@@ -147,6 +148,19 @@ enum RefillResult {
     AdapterError,
 }
 
+/// One source slot; missing PCM is zero only inside the persistent converter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SourceSample {
+    pcm: f32,
+    missing: bool,
+}
+
+/// Half-open missing interval on the consumer's accepted source timeline.
+struct GapSpan {
+    start: u128,
+    end: u128,
+}
+
 /// Persistent state touched exclusively by the consumer endpoint.
 struct ConsumerState {
     converter: Converter,
@@ -156,6 +170,10 @@ struct ConsumerState {
     input_pending: usize,
     output_offset: usize,
     output_pending: usize,
+    output_missing: bool,
+    source_taken: u128,
+    source_accepted: u128,
+    gaps: VecDeque<GapSpan>,
     plc: Option<Plc>,
     zero_progress: bool,
     occupancy_milli: u64,
@@ -167,7 +185,7 @@ struct ConsumerState {
 
 /// All preallocated payload and consumer workspaces owned by one ring.
 struct Workspaces {
-    storage: Box<[UnsafeCell<f32>]>,
+    storage: Box<[UnsafeCell<SourceSample>]>,
     input: Box<[f32]>,
     output: Box<[f32]>,
 }
@@ -182,7 +200,7 @@ struct Workspaces {
 /// empty and their storage indices stay aligned across every wrap. Release
 /// publication and acquire consumption preserve the SPSC payload ordering.
 pub(crate) struct Ring {
-    storage: Box<[UnsafeCell<f32>]>,
+    storage: Box<[UnsafeCell<SourceSample>]>,
     capacity: usize,
     capacity_u64: u64,
     written: AtomicU64,
@@ -239,7 +257,7 @@ impl Ring {
             Ok(workspaces) => workspaces,
             Err(()) => return Err(CreateError::NoMemory),
         };
-        let converter = match adapter.create_converter(
+        let mut converter = match adapter.create_converter(
             input_rate_hz,
             output_rate_hz,
             capacity as u32,
@@ -248,6 +266,14 @@ impl Ring {
             Ok(converter) => converter,
             Err(()) => return Err(CreateError::Adapter),
         };
+        // At most capacity input-workspace slots plus capacity adapter backlog
+        // and FIR history can retain gap markers. Even alternating one-frame
+        // spans fit this conservative bound without runtime growth.
+        let delay = converter.input_delay().map_err(|()| CreateError::Adapter)? as u64;
+        let history = delay.div_ceil(1_000_000_000) as usize;
+        let mut gaps = VecDeque::new();
+        gaps.try_reserve_exact(capacity * 2 + history + 2)
+            .map_err(|_| CreateError::NoMemory)?;
         Ok(Self {
             storage,
             capacity,
@@ -276,6 +302,10 @@ impl Ring {
                 input_pending: 0,
                 output_offset: 0,
                 output_pending: 0,
+                output_missing: false,
+                source_taken: 0,
+                source_accepted: 0,
+                gaps,
                 plc,
                 zero_progress: false,
                 occupancy_milli: 0,
@@ -288,6 +318,14 @@ impl Ring {
 
     /// Publish one canonical input sample without waiting or allocating.
     pub(crate) fn producer_push_sample(&self, sample: f32) -> bool {
+        self.producer_publish(SourceSample {
+            pcm: canonicalize(sample),
+            missing: false,
+        })
+    }
+
+    /// Publish one source-timeline slot through the SPSC cursor protocol.
+    fn producer_publish(&self, sample: SourceSample) -> bool {
         let written = self.written.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
         if self.cursor_distance(written, read) >= self.capacity_u64 {
@@ -298,7 +336,7 @@ impl Ring {
         // The producer owns this slot until the release store below publishes
         // it.  The sole consumer acquires `written` before reading it.
         unsafe {
-            *self.storage[index].get() = canonicalize(sample);
+            *self.storage[index].get() = sample;
         }
         self.written
             .store((written + 1) % (self.capacity_u64 * 2), Ordering::Release);
@@ -322,8 +360,22 @@ impl Ring {
         accepted
     }
 
+    /// Publish an ordered missing-source prefix without allocating or waiting.
+    pub(crate) fn producer_gap(&self, samples: u64) -> u64 {
+        for accepted in 0..samples {
+            if !self.producer_publish(SourceSample {
+                pcm: 0.0,
+                missing: true,
+            }) {
+                saturating_add_counter(&self.discarded, samples - accepted - 1);
+                return accepted;
+            }
+        }
+        samples
+    }
+
     /// Consume one source sample for the renderer's persistent converter.
-    fn consumer_take_source_sample(&self) -> Option<f32> {
+    fn consumer_take_source_sample(&self) -> Option<SourceSample> {
         let read = self.read.load(Ordering::Relaxed);
         let written = self.written.load(Ordering::Acquire);
         if read == written {
@@ -372,7 +424,7 @@ impl Ring {
             if state.output_pending == 0 {
                 state.output_offset = 0;
             }
-            Some(canonicalize(sample))
+            (!state.output_missing).then(|| canonicalize(sample))
         } else {
             None
         };
@@ -483,6 +535,10 @@ impl ConsumerState {
         self.input_pending = 0;
         self.output_offset = 0;
         self.output_pending = 0;
+        self.output_missing = false;
+        self.source_taken = 0;
+        self.source_accepted = 0;
+        self.gaps.clear();
         if let Some(plc) = &mut self.plc {
             plc.reset();
         }
@@ -517,7 +573,27 @@ impl ConsumerState {
             let Some(sample) = ring.consumer_take_source_sample() else {
                 break;
             };
-            self.input[self.input_offset + self.input_pending] = sample;
+            if sample.missing {
+                if let Some(span) = self
+                    .gaps
+                    .back_mut()
+                    .filter(|span| span.end == self.source_taken)
+                {
+                    span.end += 1;
+                } else {
+                    // The preallocated bound covers all live source positions.
+                    // Fail closed if a faulty adapter violates its queue bound.
+                    if self.gaps.len() == self.gaps.capacity() {
+                        return RefillResult::AdapterError;
+                    }
+                    self.gaps.push_back(GapSpan {
+                        start: self.source_taken,
+                        end: self.source_taken + 1,
+                    });
+                }
+            }
+            self.source_taken += 1;
+            self.input[self.input_offset + self.input_pending] = sample.pcm;
             self.input_pending += 1;
         }
         if self.input_pending == 0 && self.zero_progress {
@@ -566,14 +642,37 @@ impl ConsumerState {
             self.ratio = f64::from(ring.output_rate_hz) / f64::from(ring.input_rate_hz);
         }
 
+        self.output_missing = false;
+        if !self.gaps.is_empty() {
+            let Ok(delay) = self.converter.input_delay() else {
+                return RefillResult::AdapterError;
+            };
+            // Query before conversion, paired with only actually accepted
+            // source frames. The rounded position belongs to the next output;
+            // a call producing no output consumes no position. Negative startup
+            // positions are zero-extended real history, never a source gap.
+            let position = self
+                .source_accepted
+                .checked_sub((delay as u128).div_ceil(1_000_000_000));
+            if let Some(position) = position {
+                while self.gaps.front().is_some_and(|span| position >= span.end) {
+                    self.gaps.pop_front();
+                }
+                self.output_missing = self.gaps.front().is_some_and(|span| position >= span.start);
+            }
+        }
+        // The input scan above discovers new spans before SWR can generate
+        // their output. Existing cache is drained before entering this method.
+        let output_count = if self.gaps.is_empty() { quantum } else { 1 };
         let input = &self.input[self.input_offset..self.input_offset + self.input_pending];
-        let output = &mut self.output[..quantum];
+        let output = &mut self.output[..output_count];
         let Ok((input_used, output_generated)) = self.converter.process(input, output, self.ratio)
         else {
             return RefillResult::AdapterError;
         };
         self.input_offset += input_used;
         self.input_pending -= input_used;
+        self.source_accepted += input_used as u128;
         if self.input_pending == 0 {
             self.input_offset = 0;
         }
@@ -627,12 +726,17 @@ fn allocate_workspaces(capacity: usize) -> Result<Workspaces, ()> {
 }
 
 /// Allocate the SPSC payload cells outside real-time processing.
-fn allocate_storage(length: usize) -> Result<Box<[UnsafeCell<f32>]>, ()> {
+fn allocate_storage(length: usize) -> Result<Box<[UnsafeCell<SourceSample>]>, ()> {
     let mut storage = Vec::new();
     if storage.try_reserve_exact(length).is_err() {
         return Err(());
     }
-    storage.resize_with(length, || UnsafeCell::new(0.0));
+    storage.resize_with(length, || {
+        UnsafeCell::new(SourceSample {
+            pcm: 0.0,
+            missing: false,
+        })
+    });
     Ok(storage.into_boxed_slice())
 }
 
