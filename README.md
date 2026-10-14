@@ -107,6 +107,19 @@ vendoring its source. Give their directory explicitly:
 make SAMPLERATE_ADAPTER_DEB_DIR=/path/to/adapter-debs quality-image
 ```
 
+## Release order
+
+Release `rptadv-samplerate-adapter` `v0.2.0-alpha2` first, including both
+Debian 13 architecture packages. Pin that release's merged commit in
+`.github/dependencies.json`; keep the same tag in
+the ring quality and release workflows. Open a ring pull request and wait for
+its full required quality gate, including native amd64/arm64 jobs, before
+merging. Tag the validated main commit `v3.0.0-alpha3` to publish this ABI-3
+extension. Confirm the GitHub release contains both architecture archives,
+runtime and development Debian packages, and the source archive; then confirm
+the package index was refreshed for both dependency releases. A source push
+alone is not a release, and this procedure does not install anything on a node.
+
 ## Install
 
 ```sh
