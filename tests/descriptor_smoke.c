@@ -18,6 +18,9 @@ _Static_assert(offsetof(struct rpcr3_descriptor, ring_output_delay) == 80,
                "preserved ABI-3 prefix");
 _Static_assert(offsetof(struct rpcr3_descriptor, ring_producer_gap) == 88,
                "compatible ABI-3 gap tail");
+_Static_assert(offsetof(struct rpcr3_descriptor, ring_producer_push_tagged) ==
+                   96,
+               "compatible ABI-3 mute tail");
 
 int main(void) {
   const struct rpcr3_descriptor *descriptor = rpcr3_descriptor();
@@ -56,6 +59,9 @@ int main(void) {
   assert(descriptor->ring_output_delay != NULL);
   assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_GAP_MIN_SIZE);
   assert(descriptor->ring_producer_gap != NULL);
+  assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_MUTE_MIN_SIZE);
+  assert(descriptor->ring_producer_push_tagged &&
+         descriptor->ring_producer_mute);
   assert(descriptor->ring_create(&config, NULL) == RPCR3_INVALID_ARGUMENT);
   assert(descriptor->ring_create(NULL, &ring) == RPCR3_INVALID_ARGUMENT);
   assert(ring == NULL);
@@ -147,5 +153,20 @@ int main(void) {
     assert(descriptor->ring_consumer_reset(ring) == RPCR3_OK);
     descriptor->ring_destroy(ring);
   }
+  config.plc_mode = RPCR3_PLC_DISABLED;
+  assert(descriptor->ring_create(&config, &ring) == RPCR3_OK);
+  struct rpcr3_mute_span span = {.start = 0, .end = 160};
+  uint64_t accepted = 99;
+  assert(descriptor->ring_producer_push_tagged(ring, input, 160, 1, 0, &span, 1,
+                                               &accepted) == RPCR3_OK);
+  assert(accepted == 160);
+  uint32_t intervals = 99;
+  assert(descriptor->ring_producer_mute(ring, 1, &span, 1, &intervals) ==
+         RPCR3_OK);
+  assert(intervals == 1);
+  assert(descriptor->ring_producer_mute(ring, 2, &span, 1, &intervals) ==
+         RPCR3_INVALID_ARGUMENT);
+  assert(intervals == 1);
+  descriptor->ring_destroy(ring);
   return 0;
 }

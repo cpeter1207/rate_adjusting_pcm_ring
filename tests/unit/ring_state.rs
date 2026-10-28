@@ -61,7 +61,8 @@ fn non_power_of_two_cursor_wrap_preserves_unread_pcm() {
                 ring.consumer_take_source_sample(),
                 Some(SourceSample {
                     pcm: expected,
-                    missing: false
+                    missing: false,
+                    stamp: None,
                 })
             );
         }
@@ -149,7 +150,8 @@ fn concurrent_spsc_preserves_pcm_across_cursor_wraps() {
             actual,
             SourceSample {
                 pcm: index as f32 / 10_000.0,
-                missing: false
+                missing: false,
+                stamp: None,
             }
         );
     }

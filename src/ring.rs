@@ -9,6 +9,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::collections::VecDeque;
 
+use crate::mute::{self, History, Mailbox, Position, Span, Stamp};
 use crate::plc::Plc;
 use crate::samplerate_adapter::{AdapterFunctions, Converter};
 
@@ -153,6 +154,7 @@ enum RefillResult {
 struct SourceSample {
     pcm: f32,
     missing: bool,
+    stamp: Option<Stamp>,
 }
 
 /// Half-open missing interval on the consumer's accepted source timeline.
@@ -181,6 +183,15 @@ struct ConsumerState {
     primed: bool,
     /// A failed adapter reset blocks conversion until a later reset succeeds.
     reset_failed: bool,
+    /// Generation/source offset captured from actual source slots, never occupancy.
+    source_base: Option<(u64, i128)>,
+    cache_start: i128,
+    cache_end: i128,
+    cache_count: usize,
+    mute_history: History,
+    mute_fault: bool,
+    plc_positions: Box<[Option<Position>]>,
+    plc_position: usize,
 }
 
 /// All preallocated payload and consumer workspaces owned by one ring.
@@ -221,6 +232,11 @@ pub(crate) struct Ring {
     max_producer: usize,
     max_output: usize,
     consumer: UnsafeCell<ConsumerState>,
+    /// Only the one producer touches its optional source stamp.
+    producer_stamp: UnsafeCell<Option<Stamp>>,
+    mute_mailbox: Mailbox,
+    reset_serial: AtomicU64,
+    producer_epoch: UnsafeCell<u64>,
 }
 
 // The only non-atomic sharing is protected by the documented one-producer,
@@ -274,6 +290,19 @@ impl Ring {
         let mut gaps = VecDeque::new();
         gaps.try_reserve_exact(capacity * 2 + history + 2)
             .map_err(|_| CreateError::NoMemory)?;
+        let mute_history =
+            History::new(capacity * 2 + history + 2).map_err(|_| CreateError::NoMemory)?;
+        let mute_mailbox = Mailbox::new().map_err(|_| CreateError::NoMemory)?;
+        let delay = if settings.plc == PlcMode::G711AppendixI {
+            (u64::from(output_rate_hz) * 15).div_ceil(4000) as usize
+        } else {
+            0
+        };
+        let mut plc_positions = Vec::new();
+        plc_positions
+            .try_reserve_exact(delay)
+            .map_err(|_| CreateError::NoMemory)?;
+        plc_positions.resize(delay, None);
         Ok(Self {
             storage,
             capacity,
@@ -294,6 +323,10 @@ impl Ring {
             output_delay_samples: u64::from(converter.output_delay_samples),
             max_producer: settings.max_producer as usize,
             max_output: settings.max_output as usize,
+            producer_stamp: UnsafeCell::new(None),
+            mute_mailbox,
+            reset_serial: AtomicU64::new(0),
+            producer_epoch: UnsafeCell::new(0),
             consumer: UnsafeCell::new(ConsumerState {
                 converter,
                 input,
@@ -312,6 +345,14 @@ impl Ring {
                 ratio: 0.0,
                 primed: false,
                 reset_failed: false,
+                source_base: None,
+                cache_start: 0,
+                cache_end: 0,
+                cache_count: 0,
+                mute_history,
+                mute_fault: false,
+                plc_positions: plc_positions.into_boxed_slice(),
+                plc_position: 0,
             }),
         })
     }
@@ -321,11 +362,13 @@ impl Ring {
         self.producer_publish(SourceSample {
             pcm: canonicalize(sample),
             missing: false,
+            stamp: None,
         })
     }
 
     /// Publish one source-timeline slot through the SPSC cursor protocol.
-    fn producer_publish(&self, sample: SourceSample) -> bool {
+    fn producer_publish(&self, mut sample: SourceSample) -> bool {
+        self.sync_producer_epoch();
         let written = self.written.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
         if self.cursor_distance(written, read) >= self.capacity_u64 {
@@ -333,6 +376,16 @@ impl Ring {
             return false;
         }
         let index = (written % self.capacity_u64) as usize;
+        // Producer-only state supplies a monotonic source identity, even when
+        // PCM/gap writes use the older compatible entrypoints between tagged blocks.
+        let stamp = unsafe { &mut *self.producer_stamp.get() };
+        if let Some(current) = stamp {
+            let Some(next) = current.source.checked_add(1) else {
+                return false;
+            };
+            sample.stamp = Some(*current);
+            current.source = next;
+        }
         // The producer owns this slot until the release store below publishes
         // it.  The sole consumer acquires `written` before reading it.
         unsafe {
@@ -360,12 +413,94 @@ impl Ring {
         accepted
     }
 
+    /// Publish mute intervals before their PCM prefix. Retry only unaccepted source suffixes.
+    /// A new generation requires the caller's completed consumer reset/quiescence boundary.
+    pub(crate) fn producer_push_tagged(
+        &self,
+        input: &[f32],
+        generation: u64,
+        source_start: u64,
+        spans: &[Span],
+    ) -> Result<u64, ()> {
+        self.sync_producer_epoch();
+        let end = source_start.checked_add(input.len() as u64).ok_or(())?;
+        if input.len() > self.max_producer
+            || spans.len() > mute::MAX_SPANS
+            || spans.iter().any(|span| {
+                span.start >= span.end
+                    || span.end > end
+                    || span.start < source_start.saturating_sub(self.capacity_u64)
+            })
+        {
+            return Err(());
+        }
+        let previous = unsafe { *self.producer_stamp.get() };
+        if previous
+            .is_some_and(|stamp| stamp.generation == generation && stamp.source != source_start)
+        {
+            return Err(());
+        }
+        if self.mute_mailbox.free() < spans.len() {
+            return Ok(0);
+        }
+        let count = input
+            .len()
+            .min((self.capacity_u64 - self.available()) as usize);
+        if count == 0 {
+            return Ok(0);
+        }
+        self.mute_mailbox
+            .publish(generation, spans, source_start + count as u64);
+        unsafe {
+            *self.producer_stamp.get() = Some(Stamp {
+                generation,
+                source: source_start,
+            });
+        }
+        let accepted = self.producer_push(&input[..count]);
+        saturating_add_counter(&self.discarded, input.len() as u64 - accepted);
+        Ok(accepted)
+    }
+
+    /// Update only already accepted source positions. Returns interval-prefix credit;
+    /// zero is bounded metadata backpressure, never permission to drop the update.
+    pub(crate) fn producer_mute(&self, generation: u64, spans: &[Span]) -> Result<usize, ()> {
+        self.sync_producer_epoch();
+        let current = unsafe { *self.producer_stamp.get() }.ok_or(())?;
+        if current.generation != generation
+            || spans.len() > mute::MAX_SPANS
+            || spans.iter().any(|span| {
+                span.start >= span.end
+                    || span.end > current.source
+                    || span.start < current.source.saturating_sub(self.capacity_u64)
+            })
+        {
+            return Err(());
+        }
+        let count = spans.len().min(self.mute_mailbox.free());
+        self.mute_mailbox
+            .publish(generation, &spans[..count], current.source);
+        Ok(count)
+    }
+
+    /// Consumer reset publishes only an epoch; it never writes producer-owned state.
+    fn sync_producer_epoch(&self) {
+        let reset = self.reset_serial.load(Ordering::Acquire);
+        unsafe {
+            if *self.producer_epoch.get() != reset {
+                *self.producer_stamp.get() = None;
+                *self.producer_epoch.get() = reset;
+            }
+        }
+    }
+
     /// Publish an ordered missing-source prefix without allocating or waiting.
     pub(crate) fn producer_gap(&self, samples: u64) -> u64 {
         for accepted in 0..samples {
             if !self.producer_publish(SourceSample {
                 pcm: 0.0,
                 missing: true,
+                stamp: None,
             }) {
                 saturating_add_counter(&self.discarded, samples - accepted - 1);
                 return accepted;
@@ -409,6 +544,19 @@ impl Ring {
     pub(crate) fn consumer_render_sample(&self) -> (f32, bool, bool) {
         // Only the single consumer accesses the converter, lookahead and PLC.
         let state = unsafe { &mut *self.consumer.get() };
+        // Bound this drain even if the producer keeps publishing concurrently.
+        for _ in 0..mute::MAX_SPANS * 2 {
+            let Some(interval) = self.mute_mailbox.pop() else {
+                break;
+            };
+            if state.mute_history.insert(interval).is_err() {
+                state.mute_fault = true;
+            }
+        }
+        if state.mute_fault {
+            saturating_add_counter(&self.adapter_error_count, 1);
+            return (0.0, false, true);
+        }
         if !state.primed && !state.reset_failed {
             if self.available() < self.reserve_samples {
                 return (0.0, false, false);
@@ -416,8 +564,17 @@ impl Ring {
             state.primed = true;
         }
         let refill = state.refill_output(self, self.target_samples);
+        if state.mute_fault {
+            saturating_add_counter(&self.adapter_error_count, 1);
+            return (0.0, false, true);
+        }
         let failed = matches!(refill, RefillResult::AdapterError);
-        let input = if matches!(refill, RefillResult::Ready) {
+        let position = if matches!(refill, RefillResult::Ready) {
+            state.cache_position()
+        } else {
+            None
+        };
+        let mut input = if matches!(refill, RefillResult::Ready) {
             let sample = state.output[state.output_offset];
             state.output_offset += 1;
             state.output_pending -= 1;
@@ -428,12 +585,17 @@ impl Ring {
         } else {
             None
         };
+        // Intentional silence is real input, never loss or a PLC request. Apply
+        // again after PLC so a late interval also reaches its retained lookahead.
+        if state.mute_history.muted(position) {
+            input = Some(0.0);
+        }
         self.record_shortfall(input.is_none());
         if failed {
             saturating_add_counter(&self.adapter_error_count, 1);
         }
         // Reset failures silence all output; the reset has already cleared PLC.
-        let (output, real) = if state.reset_failed {
+        let (mut output, real) = if state.reset_failed {
             (0.0, false)
         } else {
             match &mut state.plc {
@@ -441,6 +603,18 @@ impl Ring {
                 None => (input.unwrap_or(0.0), input.is_some()),
             }
         };
+        let delayed_position = if state.plc_positions.is_empty() {
+            position
+        } else {
+            let old = state.plc_positions[state.plc_position];
+            state.plc_positions[state.plc_position] = position;
+            state.plc_position = (state.plc_position + 1) % state.plc_positions.len();
+            old
+        };
+        if state.mute_history.muted(delayed_position) {
+            output = 0.0;
+        }
+        state.mute_history.retire(delayed_position);
         (output, real, failed)
     }
 
@@ -463,7 +637,10 @@ impl Ring {
         let written = self.written.load(Ordering::Acquire);
         self.read.store(written, Ordering::Release);
         let state = unsafe { &mut *self.consumer.get() };
-        state.reset()
+        self.mute_mailbox.reset();
+        let result = state.reset();
+        self.reset_serial.fetch_add(1, Ordering::Release);
+        result
     }
 
     /// Return readable producer samples, bounded to the configured capacity.
@@ -526,6 +703,24 @@ impl Ring {
 }
 
 impl ConsumerState {
+    /// Map cached output using the adapter's actual pre/post source-consumption
+    /// positions. Its fixed ratio within a bounded process call makes this affine;
+    /// compensation is reset for that call, not inferred from requested occupancy.
+    /// Both neighboring source samples are covered at a fractional boundary.
+    fn cache_position(&self) -> Option<Position> {
+        let (generation, offset) = self.source_base?;
+        let position = self.cache_start
+            + (self.cache_end - self.cache_start) * self.output_offset as i128
+                / self.cache_count as i128
+            + offset * 1_000_000_000;
+        let low = u64::try_from(position.div_euclid(1_000_000_000)).ok()?;
+        let high = u64::try_from((position + 999_999_999).div_euclid(1_000_000_000)).ok()?;
+        Some(Position {
+            generation,
+            low,
+            high,
+        })
+    }
     /// Discard every ended-burst cache even if the adapter cannot reset.
     /// Conversion stays blocked after failure until a later reset succeeds.
     fn reset(&mut self) -> Result<(), ()> {
@@ -539,6 +734,12 @@ impl ConsumerState {
         self.source_taken = 0;
         self.source_accepted = 0;
         self.gaps.clear();
+        self.source_base = None;
+        self.cache_count = 0;
+        self.mute_history.clear();
+        self.mute_fault = false;
+        self.plc_positions.fill(None);
+        self.plc_position = 0;
         if let Some(plc) = &mut self.plc {
             plc.reset();
         }
@@ -573,6 +774,18 @@ impl ConsumerState {
             let Some(sample) = ring.consumer_take_source_sample() else {
                 break;
             };
+            if let Some(stamp) = sample.stamp {
+                let base = self.source_base.get_or_insert((
+                    stamp.generation,
+                    i128::from(stamp.source) - self.source_taken as i128,
+                ));
+                if base.0 != stamp.generation
+                    || base.1 + self.source_taken as i128 != i128::from(stamp.source)
+                {
+                    self.mute_fault = true;
+                    return RefillResult::AdapterError;
+                }
+            }
             if sample.missing {
                 if let Some(span) = self
                     .gaps
@@ -664,6 +877,14 @@ impl ConsumerState {
         // The input scan above discovers new spans before SWR can generate
         // their output. Existing cache is drained before entering this method.
         let output_count = if self.gaps.is_empty() { quantum } else { 1 };
+        let source_start = if self.source_base.is_some() {
+            match self.converter.input_delay() {
+                Ok(delay) => self.source_accepted as i128 * 1_000_000_000 - i128::from(delay),
+                Err(()) => return RefillResult::AdapterError,
+            }
+        } else {
+            0
+        };
         let input = &self.input[self.input_offset..self.input_offset + self.input_pending];
         let output = &mut self.output[..output_count];
         let Ok((input_used, output_generated)) = self.converter.process(input, output, self.ratio)
@@ -673,6 +894,18 @@ impl ConsumerState {
         self.input_offset += input_used;
         self.input_pending -= input_used;
         self.source_accepted += input_used as u128;
+        if self.source_base.is_some() && output_generated != 0 {
+            let Ok(delay) = self.converter.input_delay() else {
+                return RefillResult::AdapterError;
+            };
+            self.cache_start = source_start;
+            self.cache_end = self.source_accepted as i128 * 1_000_000_000 - i128::from(delay);
+            if self.cache_end < self.cache_start {
+                self.mute_fault = true;
+                return RefillResult::AdapterError;
+            }
+            self.cache_count = output_generated;
+        }
         if self.input_pending == 0 {
             self.input_offset = 0;
         }
@@ -735,6 +968,7 @@ fn allocate_storage(length: usize) -> Result<Box<[UnsafeCell<SourceSample>]>, ()
         UnsafeCell::new(SourceSample {
             pcm: 0.0,
             missing: false,
+            stamp: None,
         })
     });
     Ok(storage.into_boxed_slice())

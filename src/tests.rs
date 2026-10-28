@@ -1,7 +1,333 @@
 //! Unit coverage for the Rust ring using a deterministic in-process SRC fake.
 
 use crate::ring::{PlcMode, Settings};
+
+#[test]
+fn intentional_mute_updates_reach_already_converted_cache_without_loss_or_plc() {
+    use crate::mute::Span;
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push_tagged(&[0.5; 120], 7, 0, &[]), Ok(120));
+    assert_eq!(ring.consumer_render_sample(), (0.5, true, false));
+    assert_eq!(ring.producer_mute(7, &[Span { start: 10, end: 40 }]), Ok(1));
+    for source in 1..120 {
+        assert_eq!(
+            ring.consumer_render_sample(),
+            (
+                if (10..40).contains(&source) { 0.0 } else { 0.5 },
+                true,
+                false
+            )
+        );
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+    assert_eq!(ring.observe().adapter_error_count, 0);
+}
+
+#[test]
+fn intentional_mute_tags_survive_detector_release_plc_lookahead_and_generation_reset() {
+    use crate::mute::Span;
+    let ring = Ring::create(
+        Settings {
+            reserve: 40,
+            target: 128,
+            max_producer: 128,
+            max_output: 32,
+            plc: PlcMode::G711AppendixI,
+            ..settings(512, 8000, 8000)
+        },
+        adapter(&FAKE_DESCRIPTOR),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push_tagged(&[0.5; 128], 9, 0, &[]), Ok(128));
+    for _ in 0..20 {
+        ring.consumer_render_sample();
+    }
+    // This interval arrives after its samples entered both SRC and PLC caches.
+    assert_eq!(ring.producer_mute(9, &[Span { start: 10, end: 40 }]), Ok(1));
+    for output in 20..128 {
+        let (sample, _, failed) = ring.consumer_render_sample();
+        assert!(!failed);
+        let source = output - 30; // G.711 Appendix I retains 3.75 ms at 8 kHz.
+        if (10..40).contains(&source) {
+            assert_eq!(sample, 0.0, "delayed source {source}");
+        }
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+    ring.consumer_reset().unwrap();
+    assert_eq!(ring.producer_push_tagged(&[0.25; 128], 10, 0, &[]), Ok(128));
+    assert!(
+        ring.producer_mute(9, &[Span { start: 0, end: 128 }])
+            .is_err()
+    );
+    for _ in 0..30 {
+        ring.consumer_render_sample();
+    }
+    for _ in 0..98 {
+        assert_eq!(ring.consumer_render_sample(), (0.25, true, false));
+    }
+}
+
+#[test]
+fn intentional_mute_partial_admission_retries_only_its_source_suffix() {
+    use crate::mute::Span;
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push_tagged(&[0.5; 400], 1, 0, &[]), Ok(400));
+    assert_eq!(
+        ring.producer_push_tagged(
+            &[0.5; 200],
+            1,
+            400,
+            &[Span {
+                start: 460,
+                end: 550
+            }]
+        ),
+        Ok(112)
+    );
+    assert!(ring.producer_push_tagged(&[0.5; 1], 1, 600, &[]).is_err());
+    for _ in 0..100 {
+        ring.consumer_render_sample();
+    }
+    assert_eq!(
+        ring.producer_push_tagged(
+            &[0.5; 88],
+            1,
+            512,
+            &[Span {
+                start: 460,
+                end: 550
+            }]
+        ),
+        Ok(88)
+    );
+    for source in 100..600 {
+        assert_eq!(
+            ring.consumer_render_sample(),
+            (
+                if (460..550).contains(&source) {
+                    0.0
+                } else {
+                    0.5
+                },
+                true,
+                false
+            )
+        );
+    }
+}
+
+#[test]
+fn intentional_mute_actual_converter_preserves_source_edges_with_drift_and_plc() {
+    use crate::mute::Span;
+    for rate in [8000, 48000] {
+        for plc in [PlcMode::Disabled, PlcMode::G711AppendixI] {
+            let ring = Ring::create(
+                Settings {
+                    reserve: 300,
+                    target: 600,
+                    max_producer: 1200,
+                    max_output: 256,
+                    plc,
+                    ..settings(2048, rate, 48000)
+                },
+                load_functions().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ring.producer_push_tagged(&[0.5; 1200], 1, 0, &[]), Ok(1200));
+            let factor = (48000 / rate) as usize;
+            let delay = ring.output_delay_samples() as usize
+                + if plc == PlcMode::G711AppendixI {
+                    180
+                } else {
+                    0
+                };
+            let start = delay + 700 * factor;
+            let end = delay + 740 * factor;
+            for _ in 0..start - 20 {
+                assert!(!ring.consumer_render_sample().2);
+            }
+            assert_eq!(
+                ring.producer_mute(
+                    1,
+                    &[Span {
+                        start: 700,
+                        end: 740
+                    }]
+                ),
+                Ok(1)
+            );
+            let mut muted = Vec::new();
+            for output in start - 20..end + 20 {
+                let (sample, _, failed) = ring.consumer_render_sample();
+                assert!(!failed);
+                if sample == 0.0 {
+                    muted.push(output);
+                }
+            }
+            assert!(
+                muted.first().unwrap().abs_diff(start) <= factor + 1,
+                "rate={rate}, plc={plc:?}, first={:?}, expected={start}",
+                muted.first()
+            );
+            assert!(muted.last().unwrap().abs_diff(end - 1) <= factor + 1);
+            assert_eq!(ring.observe().missing_samples, 0);
+            assert_ne!(
+                ring.observe().ratio_correction_ppm,
+                0,
+                "exercise actual clock compensation"
+            );
+        }
+    }
+}
+
+#[test]
+fn intentional_mute_metadata_backpressure_and_audio_are_allocation_free() {
+    use crate::mute::Span;
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    let before = ALLOCATION_COUNT.get();
+    assert_eq!(ring.producer_push_tagged(&[0.5; 10], 1, 0, &[]), Ok(10));
+    for _ in 0..128 {
+        assert_eq!(ring.producer_mute(1, &[Span { start: 0, end: 10 }]), Ok(1));
+    }
+    assert_eq!(ring.producer_mute(1, &[Span { start: 0, end: 10 }]), Ok(0));
+    assert_eq!(
+        ring.producer_push_tagged(&[0.5], 1, 10, &[Span { start: 10, end: 11 }]),
+        Ok(0)
+    );
+    assert_eq!(
+        ring.observe().discarded_samples,
+        0,
+        "metadata backpressure is not audio loss"
+    );
+    for _ in 0..10 {
+        assert_eq!(ring.consumer_render_sample(), (0.0, true, false));
+    }
+    assert_eq!(ring.producer_mute(1, &[Span { start: 0, end: 10 }]), Ok(1));
+    ring.consumer_reset().unwrap();
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+}
 use core::ffi::{CStr, c_char, c_int, c_void};
+
+#[test]
+fn intentional_mute_gap_is_real_silence_not_a_second_concealment_request() {
+    use crate::mute::Span;
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push_tagged(&[0.5; 40], 1, 0, &[]), Ok(40));
+    assert_eq!(ring.producer_gap(20), 20);
+    assert_eq!(ring.producer_push_tagged(&[0.5; 40], 1, 60, &[]), Ok(40));
+    assert_eq!(ring.producer_mute(1, &[Span { start: 40, end: 60 }]), Ok(1));
+    for source in 0..100 {
+        assert_eq!(
+            ring.consumer_render_sample(),
+            (
+                if (40..60).contains(&source) { 0.0 } else { 0.5 },
+                true,
+                false
+            )
+        );
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
+fn intentional_mute_descriptor_tail_validates_before_touching_pcm_or_outputs() {
+    use crate::mute::Span;
+    let handle = fake_handle();
+    let table = descriptor();
+    assert_eq!(
+        core::mem::offset_of!(Descriptor, ring_producer_push_tagged),
+        96
+    );
+    let pointer = handle.as_ptr();
+    let push = table.ring_producer_push_tagged;
+    let update = table.ring_producer_mute;
+    let mut accepted = 99;
+    for (ring, input, count, spans, span_count) in [
+        (ptr::null_mut(), ptr::null(), 0, ptr::null(), 0),
+        (pointer, ptr::dangling(), 513, ptr::null(), 0),
+        (pointer, ptr::null(), 1, ptr::null(), 0),
+        (pointer, ptr::null(), 0, ptr::null(), 1),
+        (pointer, ptr::null(), 0, ptr::dangling(), 65),
+    ] {
+        assert_eq!(
+            push(ring, input, count, 1, 0, spans, span_count, &mut accepted),
+            RESULT_INVALID_ARGUMENT
+        );
+        assert_eq!(accepted, 99);
+    }
+    assert_eq!(
+        push(
+            pointer,
+            ptr::null(),
+            0,
+            1,
+            0,
+            ptr::null(),
+            0,
+            ptr::null_mut()
+        ),
+        RESULT_INVALID_ARGUMENT
+    );
+    let input = [0.5];
+    let invalid = Span { start: 2, end: 1 };
+    assert_eq!(
+        push(pointer, input.as_ptr(), 1, 1, 0, &invalid, 1, &mut accepted),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(accepted, 99);
+    assert_eq!(
+        push(
+            pointer,
+            input.as_ptr(),
+            1,
+            1,
+            u64::MAX,
+            ptr::null(),
+            0,
+            &mut accepted
+        ),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        push(
+            pointer,
+            input.as_ptr(),
+            1,
+            1,
+            0,
+            ptr::null(),
+            0,
+            &mut accepted
+        ),
+        RESULT_OK
+    );
+    assert_eq!(accepted, 1);
+    let span = Span { start: 0, end: 1 };
+    let mut intervals = 99;
+    assert_eq!(update(pointer, 1, &span, 1, &mut intervals), RESULT_OK);
+    assert_eq!(intervals, 1);
+    assert_eq!(
+        update(ptr::null_mut(), 1, &span, 1, &mut intervals),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        update(pointer, 1, ptr::null(), 1, &mut intervals),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        update(pointer, 1, &span, 1, ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        update(pointer, 2, &span, 1, &mut intervals),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(intervals, 1);
+}
 
 #[test]
 fn immutable_policy_rejects_insufficient_callback_or_burst_headroom() {
