@@ -29,11 +29,9 @@ The controller includes input queued inside the adapter, excluding fixed
 filter delay, so adapter buffering does not consume the configured jitter
 headroom. The public `available_samples` observation remains the unread FIFO
 count. Empty-input calls drain available converted PCM without an end-of-stream
-flush; continuous playout and recovery keep the filter state. Finite-media
-callers use `ring_output_delay` to discard the intrinsic output prefix and
-provide trailing padding before retaining exactly the source duration. This
-read-only callback is appended compatibly to the ABI-3 descriptor in
-3.0.0-alpha.2; callers must validate its `struct_size` before using it.
+flush; continuous playout and recovery keep the filter state. `ring_output_delay`
+reports the intrinsic output prefix for callers that manage their own finite
+padding. Callers can instead use the finite-burst operations below.
 
 `ring_producer_gap` (3.0.0-alpha.3) appends a counted missing interval in input
 samples. Check `RPCR3_DESCRIPTOR_GAP_MIN_SIZE` before using this compatible
@@ -53,6 +51,43 @@ frame error. Each mapped missing output reaches the existing PLC exactly once
 these outputs as well as actual converter shortfalls. No-gap rendering retains
 the ordinary batched converter path. Marker storage is bounded and allocated
 at construction; neither endpoint allocates or locks while streaming.
+
+## Source muting
+
+Check `RPCR3_DESCRIPTOR_MUTE_MIN_SIZE` and all mute callbacks before use.
+`ring_producer_push_tagged` publishes PCM with a generation, its absolute
+input-sample position and optional half-open mute intervals. Retry only the
+unaccepted suffix. `ring_producer_mute` adds intervals for source PCM already
+accepted by the ring, including samples retained in converter or PLC history.
+It returns interval-prefix credit. Retain and retry any unaccepted intervals.
+
+The consumer mutes output at its actual source position. Keep source positions
+contiguous within a generation; reset the consumer before changing generations
+or restarting source positions. Metadata backpressure consumes no PCM and does
+not count as discarded input. Exhausted PCM capacity follows the normal
+rejected-sample accounting.
+
+## Finite bursts
+
+Check `RPCR3_DESCRIPTOR_FINISH_MIN_SIZE` and both finish callbacks before use.
+After publishing all accepted PCM and ordered gaps, call `ring_producer_finish`
+once. Keep its nonzero token and continue rendering. A finite burst can start
+below reserve. The ring drains the accepted source duration, converter history
+and optional PLC lookahead without counting its internal padding as loss.
+Do not append caller padding when using this operation.
+
+Query `ring_finish_status` with the exact token:
+
+- `RPCR3_FINISH_PENDING`: keep rendering. New PCM and gaps return zero credit.
+- `RPCR3_FINISH_DRAINED`: accepted audio has played and the warmed reset succeeded.
+- `RPCR3_FINISH_CANCELLED`: consumer reset discarded the burst.
+- `RPCR3_FINISH_ADAPTER_ERROR`: conversion or reset failed. The failed burst is
+  discarded, not reported as played. If reset failed, call `ring_consumer_reset`
+  successfully before resuming output.
+
+Only the most recent token can be queried. Tokens do not wrap. Completion
+permits another burst; normal reserve priming applies to its new PCM. Rendering
+between completed bursts is silent and does not add shortfalls.
 
 ## Public ABI
 
