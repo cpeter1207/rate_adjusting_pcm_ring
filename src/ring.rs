@@ -438,6 +438,9 @@ impl Ring {
 
     /// Publish a bounded block and return the number accepted chronologically.
     pub(crate) fn producer_push(&self, input: &[f32]) -> u64 {
+        if self.finish_pending() {
+            return 0;
+        }
         let mut accepted = 0_u64;
         for (index, &sample) in input.iter().enumerate() {
             if self.producer_push_sample(sample) {
@@ -539,6 +542,9 @@ impl Ring {
 
     /// Publish an ordered missing-source prefix without allocating or waiting.
     pub(crate) fn producer_gap(&self, samples: u64) -> u64 {
+        if self.finish_pending() {
+            return 0;
+        }
         for accepted in 0..samples {
             if !self.producer_publish(SourceSample {
                 pcm: 0.0,

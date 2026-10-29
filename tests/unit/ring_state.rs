@@ -26,6 +26,13 @@ fn finite_short_burst_drains_below_reserve_without_loss_then_reprimes() {
     let token = ring.producer_finish().unwrap();
     assert_eq!(ring.finish_status(token), Ok(FinishStatus::Pending));
     assert!(!ring.producer_push_sample(0.8));
+    assert_eq!(ring.producer_push(&[0.8; 3]), 0);
+    assert_eq!(ring.producer_gap(3), 0);
+    assert_eq!(
+        ring.observe().discarded_samples,
+        0,
+        "finite-boundary backpressure is not loss"
+    );
     assert!(ring.producer_finish().is_err());
     for sample in [0.2, 0.4, 0.6] {
         assert_eq!(ring.consumer_render_sample(), (sample, true, false));
