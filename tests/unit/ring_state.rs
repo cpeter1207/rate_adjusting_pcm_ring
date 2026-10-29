@@ -292,6 +292,200 @@ fn tagged_source_and_gap_metadata_allocation_failures_are_recoverable() {
 }
 
 #[test]
+fn coverage_prepared_mute_and_plc_workspace_allocation_failures() {
+    for bytes in [
+        1026 * size_of::<crate::mute::Interval>(),
+        mute::MAX_SPANS * 2 * size_of::<crate::mute::Interval>(),
+        30 * size_of::<Option<Position>>(),
+    ] {
+        let result = crate::tests::fail_allocation_at(bytes, 1, || {
+            Ring::create(
+                Settings {
+                    reserve: 40,
+                    target: 128,
+                    max_output: 32,
+                    max_producer: 128,
+                    plc: PlcMode::G711AppendixI,
+                    ..crate::tests::settings(512, 8000, 8000)
+                },
+                unsafe { AdapterFunctions::from_descriptor(&FAKE_DESCRIPTOR) }.unwrap(),
+            )
+        });
+        assert!(matches!(result, Err(CreateError::NoMemory)));
+    }
+}
+
+#[test]
+fn coverage_tagged_bounds_and_exhausted_source_positions_fail_without_publication() {
+    let ring = ring(1024);
+    let token = ring.producer_finish().unwrap();
+    assert_eq!(ring.producer_push_tagged(&[0.2], 1, 0, &[]), Ok(0));
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Pending));
+    ring.consumer_reset().unwrap();
+    assert!(ring.producer_push_tagged(&[0.2; 1025], 1, 0, &[]).is_err());
+    let too_many = [Span { start: 0, end: 1 }; mute::MAX_SPANS + 1];
+    assert!(ring.producer_push_tagged(&[0.2], 1, 0, &too_many).is_err());
+    assert!(ring.producer_push_tagged(&[0.2], 1, u64::MAX, &[]).is_err());
+    assert!(
+        ring.producer_push_tagged(&[0.2], 1, 0, &[Span { start: 0, end: 2 }])
+            .is_err()
+    );
+    assert!(ring.producer_mute(1, &[]).is_err());
+    assert!(
+        ring.producer_push_tagged(&[0.2], 1, 2048, &[Span { start: 0, end: 1 }])
+            .is_err()
+    );
+    assert_eq!(ring.producer_push_tagged(&[0.2], 1, 2048, &[]), Ok(1));
+    for (generation, spans) in [
+        (2, vec![]),
+        (1, too_many.to_vec()),
+        (
+            1,
+            vec![Span {
+                start: 2048,
+                end: 2048,
+            }],
+        ),
+        (
+            1,
+            vec![Span {
+                start: 2048,
+                end: 2050,
+            }],
+        ),
+        (1, vec![Span { start: 0, end: 1 }]),
+    ] {
+        assert!(ring.producer_mute(generation, &spans).is_err());
+    }
+    unsafe {
+        *ring.producer_stamp.get() = Some(Stamp {
+            generation: 1,
+            source: u64::MAX,
+        })
+    };
+    assert!(!ring.producer_push_sample(0.3));
+    assert_eq!(ring.available(), 1);
+}
+
+#[test]
+fn coverage_mute_history_exhaustion_and_source_fences_fail_closed() {
+    let exhausted = ring(512);
+    unsafe { (*exhausted.consumer.get()).mute_history = History::new(0).unwrap() };
+    assert_eq!(
+        exhausted.producer_push_tagged(&[0.2], 1, 0, &[Span { start: 0, end: 1 }]),
+        Ok(1)
+    );
+    assert_eq!(exhausted.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(exhausted.consumer_reset(), Ok(()));
+    assert!(exhausted.producer_push_sample(0.9));
+    assert_eq!(exhausted.consumer_render_sample(), (0.9, true, false));
+    for base in [(2, 0), (1, 100)] {
+        let fenced = ring(512);
+        unsafe { (*fenced.consumer.get()).source_base = Some(base) };
+        assert_eq!(fenced.producer_push_tagged(&[0.2], 1, 0, &[]), Ok(1));
+        assert_eq!(fenced.consumer_render_sample(), (0.0, false, true));
+    }
+    let changed = ring(512);
+    assert_eq!(changed.producer_push_tagged(&[0.2], 1, 0, &[]), Ok(1));
+    assert_eq!(changed.producer_push_tagged(&[0.3], 2, 0, &[]), Ok(1));
+    assert_eq!(changed.consumer_render_sample(), (0.0, false, true));
+}
+
+#[test]
+fn coverage_source_support_rejects_fractional_u64_overflow() {
+    let ring = ring(512);
+    let state = unsafe { &mut *ring.consumer.get() };
+    state.source_base = Some((1, 0));
+    state.cache_count = 1;
+    state.cache_start = i128::from(u64::MAX) * 1_000_000_000 + 1;
+    state.cache_end = state.cache_start;
+    assert!(state.cache_position().is_none());
+    state.cache_start = 0;
+    state.cache_end = 0;
+    assert_eq!(
+        state
+            .cache_position()
+            .map(|p| (p.generation, p.low, p.high)),
+        Some((1, 0, 0))
+    );
+}
+
+#[test]
+fn coverage_finite_reset_failure_is_not_a_drained_or_cancelled_acknowledgement() {
+    static FAIL_RESET: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn reset(converter: *mut c_void) -> c_int {
+        if FAIL_RESET.swap(false, Ordering::Relaxed) {
+            return -1;
+        }
+        unsafe { FAKE_DESCRIPTOR.converter_reset.unwrap()(converter) }
+    }
+    let descriptor = AdapterDescriptor {
+        converter_reset: Some(reset),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(
+        crate::tests::settings(512, 8000, 8000),
+        unsafe { AdapterFunctions::from_descriptor(&descriptor) }.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push(&[0.2]), 1);
+    let failed = ring.producer_finish().unwrap();
+    assert_eq!(ring.consumer_render_sample(), (0.2, true, false));
+    FAIL_RESET.store(true, Ordering::Relaxed);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.finish_status(failed), Ok(FinishStatus::AdapterError));
+    assert_eq!(ring.consumer_reset(), Ok(()));
+    assert_eq!(ring.finish_status(failed), Ok(FinishStatus::AdapterError));
+    assert_eq!(ring.producer_push(&[0.9]), 1);
+    let next = ring.producer_finish().unwrap();
+    assert_eq!(ring.consumer_render_sample(), (0.9, true, false));
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(next), Ok(FinishStatus::Drained));
+    assert_eq!(ring.consumer_reset(), Ok(()));
+    assert_eq!(ring.finish_status(next), Ok(FinishStatus::Drained));
+}
+
+#[test]
+fn coverage_converter_delay_faults_and_backwards_positions_fail_closed() {
+    thread_local! { static FAULT: std::cell::Cell<(u32, usize)> = const { std::cell::Cell::new((0, 0)) }; }
+    unsafe extern "C" fn delay(_: *mut c_void, output: *mut i64) -> c_int {
+        let (mode, call) = FAULT.with(|fault| {
+            let current = fault.get();
+            fault.set((current.0, current.1 + 1));
+            current
+        });
+        if (mode == 1 && call == 0) || (mode == 2 && call == 1) {
+            return -1;
+        }
+        unsafe {
+            *output = if mode == 3 && call == 1 {
+                999_000_000_000
+            } else {
+                0
+            }
+        };
+        0
+    }
+    for mode in 1..=3 {
+        FAULT.with(|fault| fault.set((0, 0)));
+        let descriptor = AdapterDescriptor {
+            converter_input_delay: Some(delay),
+            ..FAKE_DESCRIPTOR
+        };
+        let ring = Ring::create(
+            crate::tests::settings(512, 8000, 8000),
+            unsafe { AdapterFunctions::from_descriptor(&descriptor) }.unwrap(),
+        )
+        .unwrap();
+        assert!(ring.producer_push_sample(0.2));
+        FAULT.with(|fault| fault.set((mode, 0)));
+        assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+        FAULT.with(|fault| fault.set((0, 0)));
+        assert_eq!(ring.consumer_reset(), Ok(()));
+    }
+}
+
+#[test]
 fn exhausted_gap_metadata_reports_a_fault_without_allocating() {
     let ring = ring(512);
     {

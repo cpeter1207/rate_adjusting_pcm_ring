@@ -171,3 +171,7 @@ impl History {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/mute_state.rs"]
+mod state_tests;
