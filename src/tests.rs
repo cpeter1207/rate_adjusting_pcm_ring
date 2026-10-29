@@ -175,6 +175,13 @@ fn intentional_mute_partial_admission_retries_only_its_source_suffix() {
         ),
         Ok(112)
     );
+    assert_eq!(ring.observe().discarded_samples, 88);
+    assert_eq!(ring.producer_push_tagged(&[0.5; 88], 1, 512, &[]), Ok(0));
+    assert_eq!(
+        ring.observe().discarded_samples,
+        176,
+        "complete PCM-capacity rejection must count the same way as a partial rejection"
+    );
     assert!(ring.producer_push_tagged(&[0.5; 1], 1, 600, &[]).is_err());
     for _ in 0..100 {
         ring.consumer_render_sample();

@@ -493,6 +493,7 @@ impl Ring {
             .len()
             .min((self.capacity_u64 - self.available()) as usize);
         if count == 0 {
+            saturating_add_counter(&self.discarded, input.len() as u64);
             return Ok(0);
         }
         self.mute_mailbox
@@ -785,6 +786,12 @@ impl Ring {
             FinishStatus::Drained
         };
         if failed {
+            // The producer is still gated by Pending. Retire the failed burst's
+            // unread suffix and metadata before allowing another publication.
+            // A warmed converter reset alone cannot discard FIFO source slots.
+            let written = self.written.load(Ordering::Acquire);
+            self.read.store(written, Ordering::Release);
+            self.mute_mailbox.reset();
             saturating_add_counter(&self.adapter_error_count, 1);
         }
         self.finish

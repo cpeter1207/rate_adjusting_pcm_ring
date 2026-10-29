@@ -219,6 +219,66 @@ fn finite_adapter_stall_reports_failed_completion_without_hanging() {
 }
 
 #[test]
+fn failed_finite_conversion_discards_the_whole_old_burst_before_reuse() {
+    static FAIL_NEXT: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn process(
+        converter: *mut c_void,
+        input: *const f32,
+        input_frames: u32,
+        output: *mut f32,
+        output_capacity: u32,
+        ratio: f64,
+        input_used: *mut u32,
+        output_generated: *mut u32,
+    ) -> c_int {
+        if FAIL_NEXT.swap(false, Ordering::Relaxed) {
+            return -1;
+        }
+        unsafe {
+            FAKE_DESCRIPTOR.converter_process.unwrap()(
+                converter,
+                input,
+                input_frames,
+                output,
+                output_capacity,
+                ratio,
+                input_used,
+                output_generated,
+            )
+        }
+    }
+    let descriptor = AdapterDescriptor {
+        converter_process: Some(process),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(
+        crate::tests::settings(1024, 8000, 8000),
+        unsafe { AdapterFunctions::from_descriptor(&descriptor) }.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push_tagged(&[0.2; 640], 1, 0, &[]), Ok(640));
+    let failed = ring.producer_finish().unwrap();
+    FAIL_NEXT.store(true, Ordering::Relaxed);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.finish_status(failed), Ok(FinishStatus::AdapterError));
+    assert_eq!(
+        ring.available(),
+        0,
+        "failed-burst FIFO suffix must retire before acknowledgement"
+    );
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.producer_push_tagged(&[0.9; 3], 2, 0, &[]), Ok(3));
+    let next = ring.producer_finish().unwrap();
+    for _ in 0..3 {
+        assert_eq!(ring.consumer_render_sample(), (0.9, true, false));
+    }
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(next), Ok(FinishStatus::Drained));
+    assert_eq!(ring.observe().adapter_error_count, 1);
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
 fn tagged_source_and_gap_metadata_allocation_failures_are_recoverable() {
     for bytes in [512 * size_of::<SourceSample>(), 1026 * size_of::<GapSpan>()] {
         let result = crate::tests::fail_allocation_at(bytes, 1, || {
