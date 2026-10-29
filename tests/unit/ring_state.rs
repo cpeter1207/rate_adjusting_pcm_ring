@@ -12,6 +12,206 @@ fn ring(capacity: usize) -> Ring {
 }
 
 #[test]
+fn finite_short_burst_drains_below_reserve_without_loss_then_reprimes() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 40,
+            ..crate::tests::settings(512, 8000, 8000)
+        },
+        unsafe { AdapterFunctions::from_descriptor(&FAKE_DESCRIPTOR) }.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push(&[0.2, 0.4, 0.6]), 3);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    let token = ring.producer_finish().unwrap();
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Pending));
+    assert!(!ring.producer_push_sample(0.8));
+    assert!(ring.producer_finish().is_err());
+    for sample in [0.2, 0.4, 0.6] {
+        assert_eq!(ring.consumer_render_sample(), (sample, true, false));
+    }
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Drained));
+    assert_eq!(ring.observe().missing_samples, 0);
+    for _ in 0..20 {
+        assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    }
+    assert_eq!(ring.observe().missing_samples, 0);
+    assert_eq!(ring.producer_push(&[0.7]), 1);
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    let next = ring.producer_finish().unwrap();
+    assert!(next > token);
+    assert!(ring.finish_status(token).is_err());
+    assert_eq!(ring.consumer_render_sample(), (0.7, true, false));
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(next), Ok(FinishStatus::Drained));
+}
+
+#[test]
+fn finite_tail_keeps_plc_lookahead_and_late_mute_without_inventing_loss() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 40,
+            target: 128,
+            max_producer: 128,
+            max_output: 32,
+            plc: PlcMode::G711AppendixI,
+            ..crate::tests::settings(512, 8000, 8000)
+        },
+        unsafe { AdapterFunctions::from_descriptor(&FAKE_DESCRIPTOR) }.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        ring.producer_push_tagged(&[0.2, 0.4, 0.6], 9, 0, &[]),
+        Ok(3)
+    );
+    let token = ring.producer_finish().unwrap();
+    for _ in 0..3 {
+        assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    }
+    assert_eq!(ring.producer_mute(9, &[Span { start: 1, end: 2 }]), Ok(1));
+    for _ in 3..30 {
+        assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    }
+    for expected in [0.2, 0.0, 0.6] {
+        assert_eq!(ring.consumer_render_sample(), (expected, true, false));
+    }
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Pending));
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Drained));
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
+fn finite_reset_cancels_exact_token_and_tokens_never_wrap() {
+    let ring = ring(513);
+    assert_eq!(ring.producer_push(&[0.5; 10]), 10);
+    let token = ring.producer_finish().unwrap();
+    ring.consumer_reset().unwrap();
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Cancelled));
+    assert_eq!(ring.available(), 0);
+    let empty = ring.producer_finish().unwrap();
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(ring.finish_status(empty), Ok(FinishStatus::Drained));
+    ring.finish.store(u64::MAX, Ordering::Relaxed);
+    assert!(ring.producer_finish().is_err());
+    assert!(ring.finish_status(0).is_err());
+}
+
+#[test]
+fn finite_real_src_matches_continuing_zero_extension_across_rates_and_drift() {
+    for rate in [8000, 48000] {
+        for correction in [0.999, 1.0, 1.001] {
+            for count in [1, 17, 640] {
+                let config = Settings {
+                    reserve: 700,
+                    ..crate::tests::settings(2048, rate, 48000)
+                };
+                let ring =
+                    Ring::create(config, crate::samplerate_adapter::load_functions().unwrap())
+                        .unwrap();
+                // Compare against the released converter directly. A second
+                // ring would steer its occupancy correction while the finite
+                // ring correctly freezes that ratio during zero extension.
+                let mut reference = crate::samplerate_adapter::load_functions()
+                    .unwrap()
+                    .create_converter(rate, 48000, 2048, 256)
+                    .unwrap();
+                let mut reference_output = [0.0; 256];
+                let mut reference_input = 0;
+                let mut reference_offset = 0;
+                let mut reference_count = 0;
+                let mut input = [0.0; 2048];
+                for (index, sample) in input[..count].iter_mut().enumerate() {
+                    *sample = ((index as f32 + 1.0) * 0.17).sin() * 0.5;
+                }
+                assert_eq!(ring.producer_push(&input[..count]), count as u64);
+                let token = ring.producer_finish().unwrap();
+                let ratio = 48000.0 / f64::from(rate) * correction;
+                let mut played = 0;
+                while ring.finish_status(token) == Ok(FinishStatus::Pending) {
+                    assert!(played < 4500, "finite converter never drained");
+                    unsafe {
+                        (*ring.consumer.get()).ratio = ratio;
+                    }
+                    let (actual, _, failed) = ring.consumer_render_sample();
+                    assert!(!failed, "rate={rate}, count={count}, sample={played}");
+                    if ring.finish_status(token) == Ok(FinishStatus::Pending) {
+                        while reference_offset == reference_count {
+                            let end = (reference_input + 256).min(input.len());
+                            let (used, generated) = reference
+                                .process(&input[reference_input..end], &mut reference_output, ratio)
+                                .unwrap();
+                            reference_input += used;
+                            reference_count = generated;
+                            reference_offset = 0;
+                            assert!(used != 0 || generated != 0);
+                        }
+                        let expected = reference_output[reference_offset];
+                        reference_offset += 1;
+                        assert!(
+                            (actual - expected).abs() < 0.00001,
+                            "rate={rate}, count={count}, correction={correction}, sample={played}: {actual} != {expected}"
+                        );
+                        played += 1;
+                    }
+                }
+                let expected = count as f64 * ratio + ring.output_delay_samples() as f64;
+                assert!(
+                    (played as f64 - expected).abs() <= 3.0,
+                    "rate={rate}, count={count}: played={played}, expected={expected}"
+                );
+                assert_eq!(ring.observe().missing_samples, 0);
+                assert_eq!(ring.observe().discarded_samples, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn finite_real_src_keeps_a_final_packet_gap_in_its_original_time_slot() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 700,
+            ..crate::tests::settings(2048, 8000, 48000)
+        },
+        crate::samplerate_adapter::load_functions().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push(&[0.3; 600]), 600);
+    assert_eq!(ring.producer_gap(40), 40);
+    let token = ring.producer_finish().unwrap();
+    let mut played = 0;
+    while ring.finish_status(token) == Ok(FinishStatus::Pending) {
+        assert!(played < 4500);
+        assert!(!ring.consumer_render_sample().2);
+        played += 1;
+    }
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::Drained));
+    assert!(
+        ring.observe().missing_samples.abs_diff(240) <= 1,
+        "{}",
+        ring.observe().missing_samples
+    );
+}
+
+#[test]
+fn finite_adapter_stall_reports_failed_completion_without_hanging() {
+    let ring = Ring::create(
+        crate::tests::settings(512, 8000, 8000),
+        unsafe { AdapterFunctions::from_descriptor(&crate::tests::ZERO_PROGRESS_DESCRIPTOR) }
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push(&[0.5; 3]), 3);
+    let token = ring.producer_finish().unwrap();
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, true));
+    assert_eq!(ring.finish_status(token), Ok(FinishStatus::AdapterError));
+    assert_eq!(ring.observe().adapter_error_count, 1);
+    assert_eq!(ring.observe().missing_samples, 0);
+}
+
+#[test]
 fn tagged_source_and_gap_metadata_allocation_failures_are_recoverable() {
     for bytes in [512 * size_of::<SourceSample>(), 1026 * size_of::<GapSpan>()] {
         let result = crate::tests::fail_allocation_at(bytes, 1, || {

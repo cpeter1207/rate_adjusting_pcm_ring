@@ -65,6 +65,14 @@ enum rpcr3_plc_mode {
   RPCR3_PLC_G711_APPENDIX_I = 1,
 };
 
+/** @brief Acquired result for the latest finite-source boundary token. */
+enum rpcr3_finish_status {
+  RPCR3_FINISH_PENDING = 0,       /**< Accepted PCM is still retained. */
+  RPCR3_FINISH_DRAINED = 1,       /**< FIR and PLC tail has played. */
+  RPCR3_FINISH_CANCELLED = 2,     /**< Explicit consumer reset discarded it. */
+  RPCR3_FINISH_ADAPTER_ERROR = 3, /**< Conversion or final reset failed. */
+};
+
 #if defined(__cplusplus)
 static_assert(sizeof(enum rpcr3_result) == sizeof(int32_t),
               "rpcr3_result must use the Rust c_int ABI");
@@ -354,7 +362,43 @@ struct rpcr3_descriptor {
                                           const struct rpcr3_mute_span *spans,
                                           uint32_t span_count,
                                           uint32_t *accepted);
+  /**
+   * @brief End the accepted source prefix without discarding its retained PCM.
+   * @param ring Ring with exactly one active producer.
+   * @param token Receives a nonzero, nonwrapping boundary identity on success.
+   * @return RPCR3_OK, or RPCR3_INVALID_ARGUMENT if a boundary is outstanding,
+   * token space is exhausted, or an argument is invalid. Failure changes no
+   * output or source state.
+   *
+   * Stop PCM/gap publication until ring_finish_status reports completion.
+   * Interval-only mute updates remain valid. The consumer may prime a short
+   * finite burst below reserve, releases real FIR and PLC lookahead using
+   * non-missing zero extension, then resets the warmed converter before
+   * acknowledging. Extension and post-completion silence are not packet loss.
+   * No socket, EOF flush, allocation, lock, or waiting occurs. Consumer reset
+   * with the producer quiescent cancels a pending boundary distinctly.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_FINISH_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_producer_finish)(struct rpcr3_ring *ring,
+                                            uint64_t *token);
+  /**
+   * @brief Acquire the latest boundary's exact playback outcome.
+   * @param ring Live ring; this operation touches only atomic state.
+   * @param token Most recently returned token, not zero or an older token.
+   * @param status Receives one rpcr3_finish_status value on success.
+   * @return RPCR3_OK, or RPCR3_INVALID_ARGUMENT without changing status.
+   * Call from the sole producer before starting its next burst. A drained
+   * acknowledgement, unlike zero occupancy, includes SRC and PLC caches.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_FINISH_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_finish_status)(const struct rpcr3_ring *ring,
+                                          uint64_t token, uint32_t *status);
 };
+
+/** Readable prefix required before finite-source completion operations. */
+#define RPCR3_DESCRIPTOR_FINISH_MIN_SIZE                                       \
+  (offsetof(struct rpcr3_descriptor, ring_finish_status) +                     \
+   sizeof(((struct rpcr3_descriptor *)0)->ring_finish_status))
 
 /** Readable prefix required before using source-tagged mute operations. */
 #define RPCR3_DESCRIPTOR_MUTE_MIN_SIZE                                         \

@@ -109,6 +109,10 @@ type ProducerPushTagged = extern "C" fn(
 ) -> c_int;
 /// C function type publishing an accepted prefix of interval-only updates.
 type ProducerMute = extern "C" fn(*mut Rpcr3Ring, u64, *const mute::Span, u32, *mut u32) -> c_int;
+/// C function type publishing one finite source boundary.
+type ProducerFinish = extern "C" fn(*mut Rpcr3Ring, *mut u64) -> c_int;
+/// C function type acquiring the latest finite boundary's outcome.
+type FinishQuery = extern "C" fn(*const Rpcr3Ring, u64, *mut u32) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -128,6 +132,8 @@ pub struct Descriptor {
     ring_producer_gap: ProducerGap,
     ring_producer_push_tagged: ProducerPushTagged,
     ring_producer_mute: ProducerMute,
+    ring_producer_finish: ProducerFinish,
+    ring_finish_status: FinishQuery,
 }
 
 // The descriptor contains immutable data and function pointers valid for the
@@ -536,6 +542,37 @@ extern "C" fn ring_output_delay(ring: *const Rpcr3Ring, samples: *mut u64) -> c_
     RESULT_OK
 }
 
+/// Publish a finite prefix without changing the output token on failure.
+extern "C" fn ring_producer_finish(ring: *mut Rpcr3Ring, token: *mut u64) -> c_int {
+    let (Ok(handle), Some(token)) = (unsafe { checked_ring(ring) }, unsafe { token.as_mut() })
+    else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle.ring.producer_finish() {
+        Ok(value) => {
+            *token = value;
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
+/// Acquire exact completion, distinguishing intentional reset and adapter failure.
+extern "C" fn ring_finish_status(ring: *const Rpcr3Ring, token: u64, status: *mut u32) -> c_int {
+    let (Ok(handle), Some(status)) = (unsafe { checked_ring(ring.cast_mut()) }, unsafe {
+        status.as_mut()
+    }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle.ring.finish_status(token) {
+        Ok(value) => {
+            *status = value as u32;
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
 /// The process-lifetime ABI descriptor, including compatible tail extensions.
 static DESCRIPTOR: Descriptor = Descriptor {
     struct_size: size_of::<Descriptor>() as u32,
@@ -553,6 +590,8 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_producer_gap,
     ring_producer_push_tagged,
     ring_producer_mute,
+    ring_producer_finish,
+    ring_finish_status,
 };
 
 /// Return the immutable ABI-major-3 descriptor for the Rust ring.

@@ -149,6 +149,27 @@ enum RefillResult {
     AdapterError,
 }
 
+/// Outcome for the most recently requested finite burst, never inferred from occupancy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub(crate) enum FinishStatus {
+    /// Accepted source, SRC history or PLC lookahead remains.
+    Pending = 0,
+    /// Every accepted output position played and warmed reset succeeded.
+    Drained = 1,
+    /// The caller explicitly discarded the outstanding burst.
+    Cancelled = 2,
+    /// Conversion or warmed reset failed; this is not successful drainage.
+    AdapterError = 3,
+}
+
+/// Consumer-local boundary; no producer PCM may pass this outstanding marker.
+struct Finite {
+    token: u64,
+    end: u128,
+    plc_remaining: Option<usize>,
+}
+
 /// One source slot; missing PCM is zero only inside the persistent converter.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SourceSample {
@@ -175,6 +196,12 @@ struct ConsumerState {
     output_missing: bool,
     source_taken: u128,
     source_accepted: u128,
+    /// Non-missing zero extension accepted by SRC, not published source PCM.
+    padding_accepted: u128,
+    input_padding: bool,
+    finite: Option<Finite>,
+    /// A completed finite stream stays silent until its next publication.
+    quiet: bool,
     gaps: VecDeque<GapSpan>,
     plc: Option<Plc>,
     zero_progress: bool,
@@ -237,6 +264,10 @@ pub(crate) struct Ring {
     mute_mailbox: Mailbox,
     reset_serial: AtomicU64,
     producer_epoch: UnsafeCell<u64>,
+    /// Upper 62 bits are a nonwrapping token; low bits are FinishStatus.
+    finish: AtomicU64,
+    /// Bounded work even if a broken converter consumes input without output.
+    finite_refill_limit: usize,
 }
 
 // The only non-atomic sharing is protected by the documented one-producer,
@@ -327,6 +358,8 @@ impl Ring {
             mute_mailbox,
             reset_serial: AtomicU64::new(0),
             producer_epoch: UnsafeCell::new(0),
+            finish: AtomicU64::new(0),
+            finite_refill_limit: capacity * 2 + history + CONVERTER_QUANTUM,
             consumer: UnsafeCell::new(ConsumerState {
                 converter,
                 input,
@@ -338,6 +371,10 @@ impl Ring {
                 output_missing: false,
                 source_taken: 0,
                 source_accepted: 0,
+                padding_accepted: 0,
+                input_padding: false,
+                finite: None,
+                quiet: false,
                 gaps,
                 plc,
                 zero_progress: false,
@@ -369,6 +406,9 @@ impl Ring {
     /// Publish one source-timeline slot through the SPSC cursor protocol.
     fn producer_publish(&self, mut sample: SourceSample) -> bool {
         self.sync_producer_epoch();
+        if self.finish_pending() {
+            return false;
+        }
         let written = self.written.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
         if self.cursor_distance(written, read) >= self.capacity_u64 {
@@ -423,6 +463,9 @@ impl Ring {
         spans: &[Span],
     ) -> Result<u64, ()> {
         self.sync_producer_epoch();
+        if self.finish_pending() {
+            return Ok(0);
+        }
         let end = source_start.checked_add(input.len() as u64).ok_or(())?;
         if input.len() > self.max_producer
             || spans.len() > mute::MAX_SPANS
@@ -509,6 +552,42 @@ impl Ring {
         samples
     }
 
+    /// Freeze the accepted producer prefix. The sole producer must wait for
+    /// completion before publishing the next burst; interval-only muting remains
+    /// available. Tokens never wrap, and only the latest token may be queried.
+    pub(crate) fn producer_finish(&self) -> Result<u64, ()> {
+        let current = self.finish.load(Ordering::Acquire);
+        if current != 0 && current & 3 == 0 {
+            return Err(());
+        }
+        let token = (current >> 2)
+            .checked_add(1)
+            .filter(|n| *n < 1 << 62)
+            .ok_or(())?;
+        self.finish.store(token << 2, Ordering::Release);
+        Ok(token)
+    }
+
+    /// Acquire the consumer's drainage/reset acknowledgement for this token.
+    pub(crate) fn finish_status(&self, token: u64) -> Result<FinishStatus, ()> {
+        let current = self.finish.load(Ordering::Acquire);
+        if token == 0 || current >> 2 != token {
+            return Err(());
+        }
+        Ok(match current & 3 {
+            0 => FinishStatus::Pending,
+            1 => FinishStatus::Drained,
+            2 => FinishStatus::Cancelled,
+            _ => FinishStatus::AdapterError,
+        })
+    }
+
+    /// A pending boundary gates source publication without touching either cursor.
+    fn finish_pending(&self) -> bool {
+        let current = self.finish.load(Ordering::Acquire);
+        current != 0 && current & 3 == 0
+    }
+
     /// Consume one source sample for the renderer's persistent converter.
     fn consumer_take_source_sample(&self) -> Option<SourceSample> {
         let read = self.read.load(Ordering::Relaxed);
@@ -544,6 +623,17 @@ impl Ring {
     pub(crate) fn consumer_render_sample(&self) -> (f32, bool, bool) {
         // Only the single consumer accesses the converter, lookahead and PLC.
         let state = unsafe { &mut *self.consumer.get() };
+        let finish = self.finish.load(Ordering::Acquire);
+        if finish != 0 && finish & 3 == 0 && state.finite.is_none() {
+            // Acquire follows every accepted producer slot; publication stays
+            // gated until this consumer acknowledges the exact boundary.
+            state.finite = Some(Finite {
+                token: finish >> 2,
+                end: state.source_taken + u128::from(self.available()),
+                plc_remaining: None,
+            });
+            state.quiet = false;
+        }
         // Bound this drain even if the producer keeps publishing concurrently.
         for _ in 0..mute::MAX_SPANS * 2 {
             let Some(interval) = self.mute_mailbox.pop() else {
@@ -557,13 +647,47 @@ impl Ring {
             saturating_add_counter(&self.adapter_error_count, 1);
             return (0.0, false, true);
         }
+        if state.quiet && self.available() == 0 {
+            return (0.0, false, state.reset_failed);
+        }
+        state.quiet = false;
         if !state.primed && !state.reset_failed {
-            if self.available() < self.reserve_samples {
+            if self.available() < self.reserve_samples && state.finite.is_none() {
                 return (0.0, false, false);
             }
             state.primed = true;
         }
-        let refill = state.refill_output(self, self.target_samples);
+        if state
+            .finite
+            .as_ref()
+            .is_some_and(|end| end.end == 0 || end.plc_remaining.is_some())
+        {
+            return self.drain_finite(state);
+        }
+        let mut refill = state.refill_output(self, self.target_samples);
+        // A finite tail supplies bounded, non-EOF zero extension rather than
+        // inventing a missing slot each time FIR needs more lookahead.
+        if state.finite.is_some() {
+            for _ in 0..self.finite_refill_limit {
+                if !matches!(refill, RefillResult::Starved) {
+                    break;
+                }
+                refill = state.refill_output(self, self.target_samples);
+            }
+            if matches!(refill, RefillResult::Starved) {
+                refill = RefillResult::AdapterError;
+            }
+            if matches!(refill, RefillResult::AdapterError) {
+                return self.complete_finite(state, true);
+            }
+            if state
+                .finite
+                .as_ref()
+                .is_some_and(|end| state.cache_source_position() >= end.end as i128 * 1_000_000_000)
+            {
+                return self.drain_finite(state);
+            }
+        }
         if state.mute_fault {
             saturating_add_counter(&self.adapter_error_count, 1);
             return (0.0, false, true);
@@ -618,6 +742,50 @@ impl Ring {
         (output, real, failed)
     }
 
+    /// Play only already retained PLC lookahead, then reset the warmed stream
+    /// before releasing producer ownership. Neither padding nor idle is loss.
+    fn drain_finite(&self, state: &mut ConsumerState) -> (f32, bool, bool) {
+        let end = state.finite.as_mut().unwrap();
+        let remaining = end.plc_remaining.get_or_insert(state.plc_positions.len());
+        if *remaining != 0 {
+            *remaining -= 1;
+            let (mut output, real) = state.plc.as_mut().unwrap().drain_sample();
+            let position = state.plc_positions[state.plc_position];
+            state.plc_position = (state.plc_position + 1) % state.plc_positions.len();
+            if state.mute_history.muted(position) {
+                output = 0.0;
+            }
+            state.mute_history.retire(position);
+            return (output, real, false);
+        }
+        self.complete_finite(state, false)
+    }
+
+    /// Publish completion only after the consumer's caches and converter have
+    /// stopped referencing this burst. Preserve conversion/reset failure.
+    fn complete_finite(
+        &self,
+        state: &mut ConsumerState,
+        adapter_failed: bool,
+    ) -> (f32, bool, bool) {
+        let token = state.finite.as_ref().unwrap().token;
+        let failed = state.reset().is_err() || adapter_failed;
+        state.quiet = true;
+        self.reset_serial.fetch_add(1, Ordering::Release);
+        self.record_shortfall(false);
+        let status = if failed {
+            FinishStatus::AdapterError
+        } else {
+            FinishStatus::Drained
+        };
+        if failed {
+            saturating_add_counter(&self.adapter_error_count, 1);
+        }
+        self.finish
+            .store((token << 2) | status as u64, Ordering::Release);
+        (0.0, false, failed)
+    }
+
     /// Render a validated native PCM block without callback-size assumptions.
     pub(crate) fn consumer_render(&self, output: &mut [f32]) -> (u64, bool) {
         let mut real_samples = 0_u64;
@@ -640,6 +808,11 @@ impl Ring {
         self.mute_mailbox.reset();
         let result = state.reset();
         self.reset_serial.fetch_add(1, Ordering::Release);
+        let finish = self.finish.load(Ordering::Acquire);
+        if finish != 0 && finish & 3 == 0 {
+            self.finish
+                .store(finish | FinishStatus::Cancelled as u64, Ordering::Release);
+        }
         result
     }
 
@@ -703,16 +876,20 @@ impl Ring {
 }
 
 impl ConsumerState {
+    /// Fractional input-frame position of the next cached output, independent
+    /// of optional producer mute stamps. Padding advances only this SRC clock.
+    fn cache_source_position(&self) -> i128 {
+        self.cache_start
+            + (self.cache_end - self.cache_start) * self.output_offset as i128
+                / self.cache_count as i128
+    }
     /// Map cached output using the adapter's actual pre/post source-consumption
     /// positions. Its fixed ratio within a bounded process call makes this affine;
     /// compensation is reset for that call, not inferred from requested occupancy.
     /// Both neighboring source samples are covered at a fractional boundary.
     fn cache_position(&self) -> Option<Position> {
         let (generation, offset) = self.source_base?;
-        let position = self.cache_start
-            + (self.cache_end - self.cache_start) * self.output_offset as i128
-                / self.cache_count as i128
-            + offset * 1_000_000_000;
+        let position = self.cache_source_position() + offset * 1_000_000_000;
         let low = u64::try_from(position.div_euclid(1_000_000_000)).ok()?;
         let high = u64::try_from((position + 999_999_999).div_euclid(1_000_000_000)).ok()?;
         Some(Position {
@@ -733,6 +910,9 @@ impl ConsumerState {
         self.output_missing = false;
         self.source_taken = 0;
         self.source_accepted = 0;
+        self.padding_accepted = 0;
+        self.input_padding = false;
+        self.finite = None;
         self.gaps.clear();
         self.source_base = None;
         self.cache_count = 0;
@@ -771,6 +951,9 @@ impl ConsumerState {
             ring.capacity,
         );
         while self.input_pending < desired_input {
+            if self.input_padding {
+                break;
+            }
             let Some(sample) = ring.consumer_take_source_sample() else {
                 break;
             };
@@ -809,6 +992,12 @@ impl ConsumerState {
             self.input[self.input_offset + self.input_pending] = sample.pcm;
             self.input_pending += 1;
         }
+        if self.input_pending == 0 && self.finite.is_some() {
+            self.input[..quantum].fill(0.0);
+            self.input_offset = 0;
+            self.input_pending = quantum;
+            self.input_padding = true;
+        }
         if self.input_pending == 0 && self.zero_progress {
             return RefillResult::Starved;
         }
@@ -820,7 +1009,7 @@ impl ConsumerState {
             .saturating_add(self.input_pending as u64)
             .saturating_add(u64::from(queued_input))
             .saturating_mul(1000);
-        if occupancy != 0 {
+        if occupancy != 0 && self.finite.is_none() {
             if self.occupancy_milli == 0 {
                 self.occupancy_milli = occupancy;
             } else {
@@ -864,8 +1053,7 @@ impl ConsumerState {
             // source frames. The rounded position belongs to the next output;
             // a call producing no output consumes no position. Negative startup
             // positions are zero-extended real history, never a source gap.
-            let position = self
-                .source_accepted
+            let position = (self.source_accepted + self.padding_accepted)
                 .checked_sub((delay as u128).div_ceil(1_000_000_000));
             if let Some(position) = position {
                 while self.gaps.front().is_some_and(|span| position >= span.end) {
@@ -877,13 +1065,12 @@ impl ConsumerState {
         // The input scan above discovers new spans before SWR can generate
         // their output. Existing cache is drained before entering this method.
         let output_count = if self.gaps.is_empty() { quantum } else { 1 };
-        let source_start = if self.source_base.is_some() {
-            match self.converter.input_delay() {
-                Ok(delay) => self.source_accepted as i128 * 1_000_000_000 - i128::from(delay),
-                Err(()) => return RefillResult::AdapterError,
+        let source_start = match self.converter.input_delay() {
+            Ok(delay) => {
+                (self.source_accepted + self.padding_accepted) as i128 * 1_000_000_000
+                    - i128::from(delay)
             }
-        } else {
-            0
+            Err(()) => return RefillResult::AdapterError,
         };
         let input = &self.input[self.input_offset..self.input_offset + self.input_pending];
         let output = &mut self.output[..output_count];
@@ -893,13 +1080,18 @@ impl ConsumerState {
         };
         self.input_offset += input_used;
         self.input_pending -= input_used;
-        self.source_accepted += input_used as u128;
-        if self.source_base.is_some() && output_generated != 0 {
+        if self.input_padding {
+            self.padding_accepted += input_used as u128;
+        } else {
+            self.source_accepted += input_used as u128;
+        }
+        if output_generated != 0 {
             let Ok(delay) = self.converter.input_delay() else {
                 return RefillResult::AdapterError;
             };
             self.cache_start = source_start;
-            self.cache_end = self.source_accepted as i128 * 1_000_000_000 - i128::from(delay);
+            self.cache_end = (self.source_accepted + self.padding_accepted) as i128 * 1_000_000_000
+                - i128::from(delay);
             if self.cache_end < self.cache_start {
                 self.mute_fault = true;
                 return RefillResult::AdapterError;

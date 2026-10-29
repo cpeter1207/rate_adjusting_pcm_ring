@@ -88,6 +88,19 @@ impl Plc {
         output
     }
 
+    /// Release one retained lookahead sample at finite end, without starting
+    /// concealment or classifying the non-missing zero extension as real PCM.
+    /// The ring calls this exactly once per lookahead slot before reset.
+    pub(crate) fn drain_sample(&mut self) -> (f32, bool) {
+        let read = (self.next + self.history.len() - self.real.len()) % self.history.len();
+        let output = (self.history[read], self.real[self.delayed] != 0.0);
+        self.history[self.next] = 0.0;
+        self.real[self.delayed] = 0.0;
+        self.next = (self.next + 1) % self.history.len();
+        self.delayed = (self.delayed + 1) % self.real.len();
+        output
+    }
+
     /// Compare recent 20 ms with 5–15 ms lags, first coarsely then at full rate.
     fn detect_pitch(&self) -> usize {
         let score = |lag: usize, step: usize| {

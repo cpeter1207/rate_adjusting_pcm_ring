@@ -3,6 +3,95 @@
 use crate::ring::{PlcMode, Settings};
 
 #[test]
+fn finite_descriptor_rejects_invalid_requests_and_acknowledges_without_allocation() {
+    let handle = fake_handle();
+    let table = descriptor();
+    let mut token = 99;
+    assert_eq!(
+        (table.ring_producer_finish)(core::ptr::null_mut(), &mut token),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(token, 99);
+    assert_eq!(
+        (table.ring_producer_finish)(handle.as_ptr(), core::ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    let before = ALLOCATION_COUNT.get();
+    assert_eq!(
+        (table.ring_producer_finish)(handle.as_ptr(), &mut token),
+        RESULT_OK
+    );
+    let mut status = 99;
+    assert_eq!(
+        (table.ring_finish_status)(handle.as_ptr(), token, &mut status),
+        RESULT_OK
+    );
+    assert_eq!(status, 0);
+    let mut duplicate = 99;
+    assert_eq!(
+        (table.ring_producer_finish)(handle.as_ptr(), &mut duplicate),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(duplicate, 99);
+    assert_eq!(
+        (table.ring_finish_status)(handle.as_ptr(), token, core::ptr::null_mut()),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        (table.ring_finish_status)(core::ptr::null(), token, &mut status),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        (table.ring_finish_status)(handle.as_ptr(), token + 1, &mut status),
+        RESULT_INVALID_ARGUMENT
+    );
+    assert_eq!(status, 0);
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.consumer_render_sample(), (0.0, false, false));
+    assert_eq!(
+        (table.ring_finish_status)(handle.as_ptr(), token, &mut status),
+        RESULT_OK
+    );
+    assert_eq!(status, 1);
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+}
+
+#[test]
+fn finite_real_converter_and_plc_drain_without_rust_allocations() {
+    for plc in [PlcMode::Disabled, PlcMode::G711AppendixI] {
+        let ring = Ring::create(
+            Settings {
+                reserve: 700,
+                target: 1000,
+                max_producer: 640,
+                max_output: 32,
+                plc,
+                ..settings(2048, 8000, 48000)
+            },
+            load_functions().unwrap(),
+        )
+        .unwrap();
+        let before = ALLOCATION_COUNT.get();
+        for _ in 0..4 {
+            assert_eq!(ring.producer_push(&[0.3; 640]), 640);
+            let token = ring.producer_finish().unwrap();
+            let mut count = 0;
+            while ring.finish_status(token) == Ok(crate::ring::FinishStatus::Pending) {
+                assert!(!ring.consumer_render_sample().2);
+                count += 1;
+                assert!(count < 4500);
+            }
+            assert_eq!(
+                ring.finish_status(token),
+                Ok(crate::ring::FinishStatus::Drained)
+            );
+        }
+        assert_eq!(ALLOCATION_COUNT.get(), before);
+        assert_eq!(ring.observe().missing_samples, 0);
+    }
+}
+
+#[test]
 fn intentional_mute_updates_reach_already_converted_cache_without_loss_or_plc() {
     use crate::mute::Span;
     let handle = fake_handle();
