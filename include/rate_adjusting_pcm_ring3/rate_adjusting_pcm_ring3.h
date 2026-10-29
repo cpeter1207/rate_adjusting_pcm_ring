@@ -14,6 +14,7 @@
 #define RATE_ADJUSTING_PCM_RING3_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -32,6 +33,15 @@ extern "C" {
 
 /** @brief Opaque Rust-owned PCM ring. */
 struct rpcr3_ring;
+
+/** @brief Maximum intentional-mute intervals supplied in one producer call. */
+#define RPCR3_MAXIMUM_MUTE_SPANS 64U
+/** @brief Half-open absolute input-rate source interval, not a storage cursor.
+ */
+struct rpcr3_mute_span {
+  uint64_t start; /**< First intentionally silent source sample. */
+  uint64_t end;   /**< First following sample not in this interval. */
+};
 
 /** @brief Result returned by a descriptor operation. */
 enum rpcr3_result {
@@ -53,6 +63,14 @@ enum rpcr3_plc_mode {
   RPCR3_PLC_DISABLED = 0,
   /** Use G.711 Appendix I at the output rate with 3.75 ms lookahead. */
   RPCR3_PLC_G711_APPENDIX_I = 1,
+};
+
+/** @brief Acquired result for the latest finite-source boundary token. */
+enum rpcr3_finish_status {
+  RPCR3_FINISH_PENDING = 0,       /**< Accepted PCM is still retained. */
+  RPCR3_FINISH_DRAINED = 1,       /**< FIR and PLC tail has played. */
+  RPCR3_FINISH_CANCELLED = 2,     /**< Explicit consumer reset discarded it. */
+  RPCR3_FINISH_ADAPTER_ERROR = 3, /**< Conversion or final reset failed. */
 };
 
 #if defined(__cplusplus)
@@ -290,7 +308,102 @@ struct rpcr3_descriptor {
   enum rpcr3_result (*ring_producer_gap)(struct rpcr3_ring *ring,
                                          uint64_t input_samples,
                                          uint64_t *accepted);
+  /**
+   * @brief Publish source mute metadata before its accepted PCM prefix.
+   * @param ring Ring with exactly one active producer.
+   * @param input Canonical F32 input, null only for zero samples.
+   * @param samples Input count within the configured producer maximum.
+   * @param generation Identity for this source burst; a change requires a
+   * completed consumer reset with the old producer quiescent.
+   * @param source_start Absolute source position of input[0]. Repeated calls
+   * must continue at the previously accepted prefix end, including counted
+   * gaps.
+   * @param spans Up to RPCR3_MAXIMUM_MUTE_SPANS intervals, null only for zero.
+   * Each interval has start less than end, end at most source_start + samples,
+   * and start no earlier than source_start minus capacity (saturating at zero).
+   * @param span_count Number of intervals.
+   * @param accepted Receives accepted PCM prefix length; unchanged on invalid
+   * arguments.
+   * @return RPCR3_OK on success, including zero credit; otherwise
+   * RPCR3_INVALID_ARGUMENT.
+   *
+   * Retry the unaccepted suffix with its original source positions and
+   * intervals. Bounded metadata backpressure accepts no PCM; it never waits or
+   * overwrites. Intentional silence is not loss and does not request PLC or add
+   * shortfalls. Tags follow actual converter source consumption through
+   * cached/FIR and PLC delay. Insufficient input reserve may already have
+   * played a qualifying prefix. Older PCM/gap operations continue this timeline
+   * after tagging starts.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_MUTE_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_producer_push_tagged)(
+      struct rpcr3_ring *ring, const float *input, uint64_t samples,
+      uint64_t generation, uint64_t source_start,
+      const struct rpcr3_mute_span *spans, uint32_t span_count,
+      uint64_t *accepted);
+  /**
+   * @brief Add intervals for PCM already accepted, including retained output
+   * caches.
+   * @param ring Ring with the same sole producer as PCM/gap publication.
+   * @param generation Must match the current source generation.
+   * @param spans Valid intervals within the accepted source timeline; lookback
+   * is bounded to capacity before the producer's next source position.
+   * @param span_count At most RPCR3_MAXIMUM_MUTE_SPANS.
+   * @param accepted Receives the interval-prefix count accepted without
+   * waiting.
+   * @return RPCR3_OK, including zero metadata credit; otherwise
+   * RPCR3_INVALID_ARGUMENT. Retry the remaining intervals without advancing
+   * PCM. Reset discards old tags; stale generation updates are rejected. All
+   * calls are allocation-free and lock-free.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_MUTE_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_producer_mute)(struct rpcr3_ring *ring,
+                                          uint64_t generation,
+                                          const struct rpcr3_mute_span *spans,
+                                          uint32_t span_count,
+                                          uint32_t *accepted);
+  /**
+   * @brief End the accepted source prefix without discarding its retained PCM.
+   * @param ring Ring with exactly one active producer.
+   * @param token Receives a nonzero, nonwrapping boundary identity on success.
+   * @return RPCR3_OK, or RPCR3_INVALID_ARGUMENT if a boundary is outstanding,
+   * token space is exhausted, or an argument is invalid. Failure changes no
+   * output or source state.
+   *
+   * Stop PCM/gap publication until ring_finish_status reports completion.
+   * Interval-only mute updates remain valid. The consumer may prime a short
+   * finite burst below reserve, releases real FIR and PLC lookahead using
+   * non-missing zero extension, then resets the warmed converter before
+   * acknowledging. Extension and post-completion silence are not packet loss.
+   * No socket, EOF flush, allocation, lock, or waiting occurs. Consumer reset
+   * with the producer quiescent cancels a pending boundary distinctly.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_FINISH_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_producer_finish)(struct rpcr3_ring *ring,
+                                            uint64_t *token);
+  /**
+   * @brief Acquire the latest boundary's exact playback outcome.
+   * @param ring Live ring; this operation touches only atomic state.
+   * @param token Most recently returned token, not zero or an older token.
+   * @param status Receives one rpcr3_finish_status value on success.
+   * @return RPCR3_OK, or RPCR3_INVALID_ARGUMENT without changing status.
+   * Call from the sole producer before starting its next burst. A drained
+   * acknowledgement, unlike zero occupancy, includes SRC and PLC caches.
+   * @note Compatible ABI 3 tail; check RPCR3_DESCRIPTOR_FINISH_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_finish_status)(const struct rpcr3_ring *ring,
+                                          uint64_t token, uint32_t *status);
 };
+
+/** Readable prefix required before finite-source completion operations. */
+#define RPCR3_DESCRIPTOR_FINISH_MIN_SIZE                                       \
+  (offsetof(struct rpcr3_descriptor, ring_finish_status) +                     \
+   sizeof(((struct rpcr3_descriptor *)0)->ring_finish_status))
+
+/** Readable prefix required before using source-tagged mute operations. */
+#define RPCR3_DESCRIPTOR_MUTE_MIN_SIZE                                         \
+  (offsetof(struct rpcr3_descriptor, ring_producer_mute) +                     \
+   sizeof(((struct rpcr3_descriptor *)0)->ring_producer_mute))
 
 /** Readable prefix required before calling the counted-gap descriptor tail. */
 #define RPCR3_DESCRIPTOR_GAP_MIN_SIZE                                          \

@@ -1,3 +1,11 @@
+rate-adjusting-pcm-ring (3.0.0~alpha4-1) unstable; urgency=medium
+
+  * Preserve source mute spans through resampling and concealment.
+  * Add compatible finite-burst completion and drain acknowledgements.
+  * Retire failed bursts safely and count rejected tagged PCM accurately.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 29 Oct 2026 08:14:00 -0500
+
 rate-adjusting-pcm-ring (3.0.0~alpha3-1) unstable; urgency=medium
 
   * Append counted, ordered missing-source spans to the ABI3 descriptor.

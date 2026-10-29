@@ -10,6 +10,7 @@
 #[cfg(not(target_has_atomic = "64"))]
 compile_error!("rate_adjusting_pcm_ring3 requires lock-free 64-bit atomics");
 
+mod mute;
 mod plc;
 mod ring;
 mod samplerate_adapter;
@@ -95,6 +96,23 @@ type Observe = extern "C" fn(*const Rpcr3Ring, *mut CObservation) -> c_int;
 type OutputDelay = extern "C" fn(*const Rpcr3Ring, *mut u64) -> c_int;
 /// C function type publishing a counted missing-source span.
 type ProducerGap = extern "C" fn(*mut Rpcr3Ring, u64, *mut u64) -> c_int;
+/// Compatible source-metadata entrypoints; each endpoint keeps its original owner.
+type ProducerPushTagged = extern "C" fn(
+    *mut Rpcr3Ring,
+    *const f32,
+    u64,
+    u64,
+    u64,
+    *const mute::Span,
+    u32,
+    *mut u64,
+) -> c_int;
+/// C function type publishing an accepted prefix of interval-only updates.
+type ProducerMute = extern "C" fn(*mut Rpcr3Ring, u64, *const mute::Span, u32, *mut u32) -> c_int;
+/// C function type publishing one finite source boundary.
+type ProducerFinish = extern "C" fn(*mut Rpcr3Ring, *mut u64) -> c_int;
+/// C function type acquiring the latest finite boundary's outcome.
+type FinishQuery = extern "C" fn(*const Rpcr3Ring, u64, *mut u32) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -112,6 +130,10 @@ pub struct Descriptor {
     ring_observe: Observe,
     ring_output_delay: OutputDelay,
     ring_producer_gap: ProducerGap,
+    ring_producer_push_tagged: ProducerPushTagged,
+    ring_producer_mute: ProducerMute,
+    ring_producer_finish: ProducerFinish,
+    ring_finish_status: FinishQuery,
 }
 
 // The descriptor contains immutable data and function pointers valid for the
@@ -317,6 +339,91 @@ extern "C" fn ring_producer_gap(ring: *mut Rpcr3Ring, samples: u64, accepted: *m
     RESULT_OK
 }
 
+/// Borrow a bounded metadata array without touching endpoint state on invalid arguments.
+unsafe fn checked_spans<'a>(
+    spans: *const mute::Span,
+    count: u32,
+) -> Result<&'a [mute::Span], c_int> {
+    if count as usize > mute::MAX_SPANS {
+        return Err(RESULT_INVALID_ARGUMENT);
+    }
+    if count == 0 {
+        return Ok(&[]);
+    }
+    if spans.is_null() {
+        return Err(RESULT_INVALID_ARGUMENT);
+    }
+    Ok(unsafe { core::slice::from_raw_parts(spans, count as usize) })
+}
+
+/// Publish source spans before the corresponding accepted PCM becomes visible.
+extern "C" fn ring_producer_push_tagged(
+    ring: *mut Rpcr3Ring,
+    input: *const f32,
+    samples: u64,
+    generation: u64,
+    source_start: u64,
+    spans: *const mute::Span,
+    count: u32,
+    accepted: *mut u64,
+) -> c_int {
+    let Some(accepted) = NonNull::new(accepted) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let Ok(handle) = (unsafe { checked_ring(ring) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    if samples > handle.ring.max_producer_samples() as u64 {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    let Ok(input) = (unsafe { checked_input(input, samples) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let Ok(spans) = (unsafe { checked_spans(spans, count) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle
+        .ring
+        .producer_push_tagged(input, generation, source_start, spans)
+    {
+        Ok(count) => {
+            unsafe {
+                *accepted.as_ptr() = count;
+            }
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
+/// Retrospective interval-only update, with an explicit accepted interval-prefix count.
+extern "C" fn ring_producer_mute(
+    ring: *mut Rpcr3Ring,
+    generation: u64,
+    spans: *const mute::Span,
+    count: u32,
+    accepted: *mut u32,
+) -> c_int {
+    let Some(accepted) = NonNull::new(accepted) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let Ok(handle) = (unsafe { checked_ring(ring) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    let Ok(spans) = (unsafe { checked_spans(spans, count) }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle.ring.producer_mute(generation, spans) {
+        Ok(count) => {
+            unsafe {
+                *accepted.as_ptr() = count as u32;
+            }
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
 /// Render one output sample and report whether it came from converted source PCM.
 extern "C" fn ring_consumer_render_sample(
     ring: *mut Rpcr3Ring,
@@ -435,6 +542,37 @@ extern "C" fn ring_output_delay(ring: *const Rpcr3Ring, samples: *mut u64) -> c_
     RESULT_OK
 }
 
+/// Publish a finite prefix without changing the output token on failure.
+extern "C" fn ring_producer_finish(ring: *mut Rpcr3Ring, token: *mut u64) -> c_int {
+    let (Ok(handle), Some(token)) = (unsafe { checked_ring(ring) }, unsafe { token.as_mut() })
+    else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle.ring.producer_finish() {
+        Ok(value) => {
+            *token = value;
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
+/// Acquire exact completion, distinguishing intentional reset and adapter failure.
+extern "C" fn ring_finish_status(ring: *const Rpcr3Ring, token: u64, status: *mut u32) -> c_int {
+    let (Ok(handle), Some(status)) = (unsafe { checked_ring(ring.cast_mut()) }, unsafe {
+        status.as_mut()
+    }) else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    match handle.ring.finish_status(token) {
+        Ok(value) => {
+            *status = value as u32;
+            RESULT_OK
+        }
+        Err(()) => RESULT_INVALID_ARGUMENT,
+    }
+}
+
 /// The process-lifetime ABI descriptor, including compatible tail extensions.
 static DESCRIPTOR: Descriptor = Descriptor {
     struct_size: size_of::<Descriptor>() as u32,
@@ -450,6 +588,10 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_observe,
     ring_output_delay,
     ring_producer_gap,
+    ring_producer_push_tagged,
+    ring_producer_mute,
+    ring_producer_finish,
+    ring_finish_status,
 };
 
 /// Return the immutable ABI-major-3 descriptor for the Rust ring.
