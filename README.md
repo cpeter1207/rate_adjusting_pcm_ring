@@ -67,6 +67,42 @@ or restarting source positions. Metadata backpressure consumes no PCM and does
 not count as discarded input. Exhausted PCM capacity follows the normal
 rejected-sample accounting.
 
+## Timed sample rendering
+
+Check `RPCR3_DESCRIPTOR_TIMED_MIN_SIZE` and the
+`ring_consumer_render_sample_timed` callback before using it. The sized
+`rpcr3_timed_sample_v1` result accompanies one sample from the existing
+consumer, including its converter cache and PLC delay. Ordinary and timed
+rendering can be interleaved on that same sole consumer. The ABI3 prefix,
+configuration, SONAME and existing callbacks stay unchanged.
+
+With `RPCR3_TIMED_POSITION_VALID`, generation plus signed magnitude identifies
+the output on the original input timeline: sign times `(source_frame +
+source_fraction_billionths/1e9)`. Whole frames retain the full unsigned 64-bit
+domain; fractional startup can be negative. This uses the same measured
+converter-position mapping as muting and does not multiply a long-lived index
+into a signed 64-bit fixed-point value. Begin with tagged publication for a
+fully mapped stream. Earlier untagged PCM remains unmapped after later tagging;
+its previous mute behavior is preserved.
+
+`REAL` matches the existing real-sample classification, including recovery
+blends. `ZERO_EXTENSION` distinguishes startup FIR history from admitted PCM.
+`GAP` identifies an ordered missing source slot; `PLC` identifies synthesis for
+that slot or an unmapped shortfall, not fresh source PCM. These source slots
+describe playout timing, not the provenance of the historical PLC waveform.
+Intentional muting adds `MUTED` without converting real silence into loss.
+Muting a gap before PLC admission replaces its PLC request with intentional
+real silence: `GAP | MUTED | REAL`, without PLC. A later mute of a gap already
+retained in PLC lookahead adds `MUTED` and gates its output to zero while
+preserving `GAP | PLC` and the original false REAL classification.
+Initial PLC delay and idle output remain unmapped. Reset and finite completion
+retire metadata with the PCM/history they describe.
+
+The ring reads no wall clock and invents no admission timestamps. Its caller
+keeps bounded admission anchors keyed by generation and the actually accepted
+source prefixes. Invalid pointers or short result sizes consume nothing and
+leave output unchanged. Streaming and reset retain their prepared storage.
+
 ## Finite bursts
 
 Check `RPCR3_DESCRIPTOR_FINISH_MIN_SIZE` and both finish callbacks before use.
