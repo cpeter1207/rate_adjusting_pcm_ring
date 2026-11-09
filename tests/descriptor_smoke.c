@@ -23,6 +23,12 @@ _Static_assert(offsetof(struct rpcr3_descriptor, ring_producer_push_tagged) ==
                "compatible ABI-3 mute tail");
 _Static_assert(offsetof(struct rpcr3_descriptor, ring_producer_finish) == 112,
                "compatible ABI-3 finite-source tail");
+_Static_assert(offsetof(struct rpcr3_descriptor,
+                        ring_consumer_render_sample_timed) == 128,
+               "compatible ABI-3 timed-sample tail");
+_Static_assert(sizeof(struct rpcr3_timed_sample_v1) == 32, "timed sample size");
+_Static_assert(offsetof(struct rpcr3_timed_sample_v1, source_frame) == 16,
+               "timed whole-frame offset");
 
 int main(void) {
   const struct rpcr3_descriptor *descriptor = rpcr3_descriptor();
@@ -59,6 +65,8 @@ int main(void) {
   assert(descriptor->ring_consumer_reset != NULL);
   assert(descriptor->ring_observe != NULL);
   assert(descriptor->ring_output_delay != NULL);
+  assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_TIMED_MIN_SIZE);
+  assert(descriptor->ring_consumer_render_sample_timed != NULL);
   assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_GAP_MIN_SIZE);
   assert(descriptor->ring_producer_gap != NULL);
   assert(descriptor->struct_size >= RPCR3_DESCRIPTOR_MUTE_MIN_SIZE);
@@ -193,6 +201,20 @@ int main(void) {
   assert(descriptor->ring_observe(ring, &observation) == RPCR3_OK);
   assert(observation.available_samples == 0 &&
          observation.missing_samples == 0);
+  descriptor->ring_destroy(ring);
+  config.reserve_samples = config.target_samples = 0;
+  assert(descriptor->ring_create(&config, &ring) == RPCR3_OK);
+  assert(descriptor->ring_producer_push_tagged(ring, input, 160, 33,
+                                               UINT64_MAX - 512, NULL, 0,
+                                               &accepted) == RPCR3_OK);
+  struct rpcr3_timed_sample_v1 timing = {.struct_size = sizeof(timing)};
+  float timed_sample = 0.0F;
+  assert(descriptor->ring_consumer_render_sample_timed(ring, &timed_sample,
+                                                       &timing) == RPCR3_OK);
+  assert((timing.flags & RPCR3_TIMED_POSITION_VALID) != 0);
+  assert(timing.generation == 33 && timing.source_frame > INT64_MAX);
+  assert(timing.source_fraction_billionths < 1000000000U);
+  assert(timing.reserved == 0);
   descriptor->ring_destroy(ring);
   return 0;
 }

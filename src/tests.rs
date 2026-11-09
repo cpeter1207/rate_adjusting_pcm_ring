@@ -2,6 +2,420 @@
 
 use crate::ring::{PlcMode, Settings};
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimedSample {
+    struct_size: u32,
+    flags: u32,
+    generation: u64,
+    source_frame: u64,
+    source_fraction_billionths: u32,
+    reserved: u32,
+}
+
+impl Default for TimedSample {
+    fn default() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            flags: 0,
+            generation: 0,
+            source_frame: 0,
+            source_fraction_billionths: 0,
+            reserved: 0,
+        }
+    }
+}
+
+type TimedRender = extern "C" fn(*mut Rpcr3Ring, *mut f32, *mut TimedSample) -> c_int;
+
+fn timed_callback() -> TimedRender {
+    let offset = core::mem::offset_of!(Descriptor, ring_finish_status) + size_of::<usize>();
+    let table = descriptor();
+    assert!(
+        table.struct_size as usize >= offset + size_of::<TimedRender>(),
+        "timed-sample descriptor tail missing"
+    );
+    unsafe {
+        (table as *const Descriptor)
+            .cast::<u8>()
+            .add(offset)
+            .cast::<TimedRender>()
+            .read()
+    }
+}
+
+#[test]
+fn timed_samples_preserve_generation_and_legacy_consumption_without_allocation() {
+    let timed = timed_callback();
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(
+        ring.producer_push_tagged(&[0.2, 0.3, 0.4], 0, 123, &[]),
+        Ok(3)
+    );
+    let before = ALLOCATION_COUNT.get();
+    let mut sample = 42.0;
+    let mut tag = TimedSample::default();
+    assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+    assert_eq!(sample, 0.2);
+    assert_eq!(tag.flags, 1 | 4);
+    assert_eq!(
+        (
+            tag.generation,
+            tag.source_frame,
+            tag.source_fraction_billionths
+        ),
+        (0, 123, 0)
+    );
+    assert_eq!(ring.consumer_render_sample(), (0.3, true, false));
+    assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+    assert_eq!((sample, tag.source_frame), (0.4, 125));
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+}
+
+#[test]
+fn timed_invalid_arguments_leave_output_and_source_unconsumed() {
+    let timed = timed_callback();
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push_tagged(&[0.5], 7, 100, &[]), Ok(1));
+    let mut sample = 42.0;
+    let mut tag = TimedSample {
+        flags: 99,
+        ..TimedSample::default()
+    };
+    for (ring_pointer, sample_null, result_null, size) in [
+        (ptr::null_mut(), false, false, 32),
+        (handle.as_ptr(), true, false, 32),
+        (handle.as_ptr(), false, true, 32),
+        (handle.as_ptr(), false, false, 4),
+    ] {
+        tag.struct_size = size;
+        let expected = tag;
+        assert_eq!(
+            timed(
+                ring_pointer,
+                if sample_null {
+                    ptr::null_mut()
+                } else {
+                    &mut sample
+                },
+                if result_null {
+                    ptr::null_mut()
+                } else {
+                    &mut tag
+                },
+            ),
+            RESULT_INVALID_ARGUMENT
+        );
+        assert_eq!(sample, 42.0);
+        assert_eq!(tag, expected);
+        assert_eq!(ring.available(), 1);
+    }
+    tag.struct_size = 32;
+    assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+    assert_eq!((sample, tag.source_frame), (0.5, 100));
+    #[repr(C)]
+    struct Extended {
+        prefix: TimedSample,
+        tail: u64,
+    }
+    let mut extended = Extended {
+        prefix: TimedSample {
+            struct_size: size_of::<Extended>() as u32,
+            ..TimedSample::default()
+        },
+        tail: 0x123456789abcdef0,
+    };
+    assert_eq!(ring.producer_push_tagged(&[0.6], 7, 101, &[]), Ok(1));
+    assert_eq!(
+        timed(handle.as_ptr(), &mut sample, &mut extended.prefix),
+        RESULT_OK
+    );
+    assert_eq!(extended.prefix.struct_size, 32);
+    assert_eq!(extended.tail, 0x123456789abcdef0);
+}
+
+#[test]
+fn timed_untagged_prefix_is_not_assigned_a_later_generation() {
+    let timed = timed_callback();
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push(&[0.1, 0.2, 0.3]), 3);
+    assert_eq!(ring.producer_push_tagged(&[0.4], 9, 100, &[]), Ok(1));
+    let mut sample = 0.0;
+    let mut tag = TimedSample::default();
+    for _ in 0..3 {
+        assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+        assert_eq!(tag.flags, 4);
+        assert_eq!(
+            (
+                tag.generation,
+                tag.source_frame,
+                tag.source_fraction_billionths
+            ),
+            (0, 0, 0)
+        );
+    }
+    assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+    assert_eq!(
+        (tag.flags, tag.generation, tag.source_frame),
+        (1 | 4, 9, 100)
+    );
+}
+
+#[test]
+fn timed_unmapped_prefix_preserves_existing_mute_support_and_runtime_errors() {
+    let timed = timed_callback();
+    let handle = fake_handle();
+    let ring = unsafe { &(*handle.as_ptr()).ring };
+    assert_eq!(ring.producer_push(&[0.1, 0.2, 0.3]), 3);
+    assert_eq!(
+        ring.producer_push_tagged(&[0.4], 9, 100, &[crate::mute::Span { start: 97, end: 99 }]),
+        Ok(1)
+    );
+    let mut sample = 42.0;
+    let mut tag = TimedSample::default();
+    for _ in 0..2 {
+        assert_eq!(timed(handle.as_ptr(), &mut sample, &mut tag), RESULT_OK);
+        assert_eq!(
+            (sample, tag.flags, tag.generation, tag.source_frame),
+            (0.0, 4 | 32, 0, 0)
+        );
+    }
+    let failing = handle_with(adapter(&FAILING_DESCRIPTOR));
+    assert_eq!(
+        timed(failing.as_ptr(), &mut sample, &mut tag),
+        RESULT_ADAPTER_ERROR
+    );
+    assert_eq!((sample, tag.flags, tag.source_frame), (0.0, 0, 0));
+}
+
+#[test]
+fn timed_finite_plc_tail_retires_original_metadata_before_the_next_generation() {
+    let ring = Ring::create(
+        Settings {
+            reserve: 700,
+            target: 1000,
+            max_producer: 640,
+            max_output: 32,
+            plc: PlcMode::G711AppendixI,
+            ..settings(2048, 8000, 48000)
+        },
+        load_functions().unwrap(),
+    )
+    .unwrap();
+    for generation in [11, 12] {
+        assert_eq!(
+            ring.producer_push_tagged(&[0.3; 512], generation, 70, &[]),
+            Ok(512)
+        );
+        let token = ring.producer_finish().unwrap();
+        let before = ALLOCATION_COUNT.get();
+        let mut valid = 0;
+        let mut outputs = 0;
+        while ring.finish_status(token) == Ok(crate::ring::FinishStatus::Pending) {
+            let (_, tag, failed) = ring.consumer_render_sample_timed();
+            assert!(!failed);
+            if tag.flags & 1 != 0 {
+                assert_eq!(tag.generation, generation);
+                assert!(tag.source_frame < 582);
+                valid += 1;
+            }
+            outputs += 1;
+            assert!(outputs < 4500);
+        }
+        assert!(valid >= 3072);
+        assert_eq!(ring.consumer_render_sample_timed().1.flags, 0);
+        assert_eq!(ALLOCATION_COUNT.get(), before);
+    }
+}
+
+#[test]
+fn timed_plc_gaps_late_mutes_and_reset_follow_actual_delayed_pcm() {
+    let make = || {
+        Ring::create(
+            Settings {
+                reserve: 64,
+                target: 64,
+                max_producer: 128,
+                max_output: 1,
+                plc: PlcMode::G711AppendixI,
+                ..settings(512, 8000, 8000)
+            },
+            adapter(&FAKE_DESCRIPTOR),
+        )
+        .unwrap()
+    };
+    let timed = make();
+    let ordinary = make();
+    for ring in [&timed, &ordinary] {
+        assert_eq!(ring.producer_push_tagged(&[0.5; 64], 7, 1000, &[]), Ok(64));
+        assert_eq!(ring.producer_gap(2), 2);
+        assert_eq!(ring.producer_push_tagged(&[0.25; 64], 7, 1066, &[]), Ok(64));
+    }
+    let before = ALLOCATION_COUNT.get();
+    for output in 0..180 {
+        if output == 15 {
+            for ring in [&timed, &ordinary] {
+                assert_eq!(
+                    ring.producer_mute(
+                        7,
+                        &[crate::mute::Span {
+                            start: 1010,
+                            end: 1020
+                        }]
+                    ),
+                    Ok(1)
+                );
+            }
+        }
+        let (sample, tag, failed) = timed.consumer_render_sample_timed();
+        assert_eq!(
+            (sample, tag.flags & 4 != 0, failed),
+            ordinary.consumer_render_sample()
+        );
+        assert!(!failed);
+        match output {
+            0..=29 => assert_eq!((sample, tag.flags), (0.0, 0)),
+            30..=159 => {
+                assert_eq!(
+                    (
+                        tag.generation,
+                        tag.source_frame,
+                        tag.source_fraction_billionths
+                    ),
+                    (7, 1000 + output - 30, 0)
+                );
+                if (94..96).contains(&output) {
+                    assert_eq!(tag.flags, 1 | 8 | 16);
+                } else if (40..50).contains(&output) {
+                    assert_eq!((sample, tag.flags), (0.0, 1 | 4 | 32));
+                } else {
+                    assert_eq!(tag.flags, 1 | 4);
+                }
+            }
+            _ => {
+                assert_eq!(tag.flags, 8);
+                assert_eq!((tag.generation, tag.source_frame), (0, 0));
+            }
+        }
+    }
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+    timed.consumer_reset().unwrap();
+    assert_eq!(timed.producer_push_tagged(&[0.25; 64], 8, 50, &[]), Ok(64));
+    for _ in 0..30 {
+        assert_eq!(timed.consumer_render_sample_timed().1.flags, 0);
+    }
+    let (_, tag, failed) = timed.consumer_render_sample_timed();
+    assert!(!failed);
+    assert_eq!(
+        (tag.flags, tag.generation, tag.source_frame),
+        (1 | 4, 8, 50)
+    );
+}
+
+#[test]
+fn timed_late_mute_preserves_the_plc_classification_already_in_lookahead() {
+    let make = || {
+        Ring::create(
+            Settings {
+                reserve: 64,
+                target: 64,
+                max_producer: 128,
+                max_output: 1,
+                plc: PlcMode::G711AppendixI,
+                ..settings(512, 8000, 8000)
+            },
+            adapter(&FAKE_DESCRIPTOR),
+        )
+        .unwrap()
+    };
+    let timed = make();
+    let ordinary = make();
+    for ring in [&timed, &ordinary] {
+        assert_eq!(ring.producer_push_tagged(&[0.5; 64], 7, 1000, &[]), Ok(64));
+        assert_eq!(ring.producer_gap(2), 2);
+        assert_eq!(ring.producer_push_tagged(&[0.25; 64], 7, 1066, &[]), Ok(64));
+    }
+    let before = ALLOCATION_COUNT.get();
+    for output in 0..96 {
+        if output == 66 {
+            for ring in [&timed, &ordinary] {
+                assert_eq!(
+                    ring.producer_mute(
+                        7,
+                        &[crate::mute::Span {
+                            start: 1064,
+                            end: 1066
+                        }]
+                    ),
+                    Ok(1)
+                );
+            }
+        }
+        let (sample, timing, failed) = timed.consumer_render_sample_timed();
+        let ordinary_output = ordinary.consumer_render_sample();
+        assert_eq!((sample, timing.flags & 4 != 0, failed), ordinary_output);
+        if output >= 94 {
+            assert_eq!((sample, ordinary_output.1, failed), (0.0, false, false));
+            assert_eq!(timing.flags, 1 | 8 | 16 | 32);
+            assert_eq!(
+                (timing.generation, timing.source_frame),
+                (7, 1064 + output - 94)
+            );
+        }
+    }
+    assert_eq!(ALLOCATION_COUNT.get(), before);
+}
+
+#[test]
+fn timed_real_src_preserves_fractional_negative_and_long_lived_source_positions() {
+    for start in [0, u64::MAX - 1000] {
+        let make = || Ring::create(settings(2048, 8000, 48000), load_functions().unwrap()).unwrap();
+        let timed = make();
+        let ordinary = make();
+        for ring in [&timed, &ordinary] {
+            assert_eq!(
+                ring.producer_push_tagged(&[0.3; 512], 12, start, &[]),
+                Ok(512)
+            );
+        }
+        let mut previous: Option<i128> = None;
+        let before = ALLOCATION_COUNT.get();
+        for output in 0..2800 {
+            let (sample, tag, failed) = timed.consumer_render_sample_timed();
+            assert_eq!(
+                (sample, tag.flags & 4 != 0, failed),
+                ordinary.consumer_render_sample()
+            );
+            assert!(!failed);
+            assert_eq!(tag.flags & 1, 1);
+            assert_eq!(tag.generation, 12);
+            assert!(tag.source_fraction_billionths < 1_000_000_000);
+            let magnitude = i128::from(tag.source_frame) * 1_000_000_000
+                + i128::from(tag.source_fraction_billionths);
+            let position = if tag.flags & 2 != 0 {
+                -magnitude
+            } else {
+                magnitude
+            };
+            if let Some(previous) = previous {
+                assert!((position - previous - 166_666_667_i128).abs() <= 2);
+            }
+            if output == 0 {
+                assert_eq!(tag.flags & 64, 64);
+                assert_eq!(tag.flags & 2 != 0, start == 0);
+            }
+            if output > 100 {
+                assert_eq!(tag.flags & 64, 0);
+            }
+            previous = Some(position);
+        }
+        assert_eq!(ALLOCATION_COUNT.get(), before);
+    }
+}
+
 #[test]
 fn finite_descriptor_rejects_invalid_requests_and_acknowledges_without_allocation() {
     let handle = fake_handle();
@@ -317,13 +731,22 @@ fn intentional_mute_gap_is_real_silence_not_a_second_concealment_request() {
     assert_eq!(ring.producer_push_tagged(&[0.5; 40], 1, 60, &[]), Ok(40));
     assert_eq!(ring.producer_mute(1, &[Span { start: 40, end: 60 }]), Ok(1));
     for source in 0..100 {
+        let (sample, timing, failed) = ring.consumer_render_sample_timed();
         assert_eq!(
-            ring.consumer_render_sample(),
+            (sample, timing.flags & 4 != 0, failed),
             (
                 if (40..60).contains(&source) { 0.0 } else { 0.5 },
                 true,
                 false
             )
+        );
+        assert_eq!(
+            timing.flags,
+            if (40..60).contains(&source) {
+                1 | 4 | 16 | 32
+            } else {
+                1 | 4
+            }
         );
     }
     assert_eq!(ring.observe().missing_samples, 0);

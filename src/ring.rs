@@ -184,6 +184,97 @@ struct GapSpan {
     end: u128,
 }
 
+/// A signed-magnitude source coordinate is available for this emitted slot.
+pub(crate) const TIMED_POSITION_VALID: u32 = 1;
+/// The valid source coordinate is negative; zero is never negative.
+pub(crate) const TIMED_NEGATIVE: u32 = 2;
+/// Matches the existing consumer's real-PCM classification, including recovery blends.
+pub(crate) const TIMED_REAL: u32 = 4;
+/// The slot requested waveform substitution, not newly received source PCM.
+pub(crate) const TIMED_PLC: u32 = 8;
+/// The source coordinate falls in a producer-published missing interval.
+pub(crate) const TIMED_GAP: u32 = 16;
+/// Intentional source muting applies to the emitted slot.
+pub(crate) const TIMED_MUTED: u32 = 32;
+/// The coordinate precedes the first accepted source sample's FIR history.
+pub(crate) const TIMED_ZERO_EXTENSION: u32 = 64;
+/// Internal mute support for a pre-tag prefix; cleared before exposing any result.
+const TIMED_LEGACY_ONLY: u32 = 1 << 31;
+
+/// ABI3 timed-sample result; position magnitude does not multiply a long-lived index.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SampleTiming {
+    /// Caller-readable prefix size; returned as the implemented size.
+    pub(crate) struct_size: u32,
+    /// TIMED flags; absence of POSITION_VALID forbids assigning source age.
+    pub(crate) flags: u32,
+    /// Original producer generation; zero is a valid identity.
+    pub(crate) generation: u64,
+    /// Whole frames in the magnitude of the signed source coordinate.
+    pub(crate) source_frame: u64,
+    /// Fractional magnitude, from zero through 999,999,999.
+    pub(crate) source_fraction_billionths: u32,
+    /// Always zero in this result revision.
+    pub(crate) reserved: u32,
+}
+
+impl SampleTiming {
+    /// An output classification without an invented source coordinate.
+    fn unmapped(flags: u32) -> Self {
+        Self {
+            struct_size: std::mem::size_of::<Self>() as u32,
+            flags,
+            generation: 0,
+            source_frame: 0,
+            source_fraction_billionths: 0,
+            reserved: 0,
+        }
+    }
+
+    /// Preserve negative startup and the full unsigned producer index domain.
+    fn at(generation: u64, position: i128, flags: u32) -> Self {
+        let magnitude = position.unsigned_abs();
+        let Ok(source_frame) = u64::try_from(magnitude / 1_000_000_000) else {
+            return Self::unmapped(flags);
+        };
+        Self {
+            flags: flags | TIMED_POSITION_VALID | if position < 0 { TIMED_NEGATIVE } else { 0 },
+            generation,
+            source_frame,
+            source_fraction_billionths: (magnitude % 1_000_000_000) as u32,
+            ..Self::unmapped(0)
+        }
+    }
+
+    /// Preserve the existing conservative pair of source samples used by muting.
+    fn mute_position(self) -> Option<Position> {
+        if self.flags & (TIMED_POSITION_VALID | TIMED_LEGACY_ONLY) == 0
+            || self.flags & TIMED_NEGATIVE != 0
+        {
+            return None;
+        }
+        Some(Position {
+            generation: self.generation,
+            low: self.source_frame,
+            high: self
+                .source_frame
+                .checked_add(u64::from(self.source_fraction_billionths != 0))?,
+        })
+    }
+
+    /// Earlier untagged PCM keeps mute support without acquiring a public identity.
+    fn public(self) -> Self {
+        if self.flags & TIMED_LEGACY_ONLY != 0 {
+            Self::unmapped(
+                self.flags & !(TIMED_LEGACY_ONLY | TIMED_POSITION_VALID | TIMED_NEGATIVE),
+            )
+        } else {
+            self
+        }
+    }
+}
+
 /// Persistent state touched exclusively by the consumer endpoint.
 struct ConsumerState {
     converter: Converter,
@@ -212,12 +303,14 @@ struct ConsumerState {
     reset_failed: bool,
     /// Generation/source offset captured from actual source slots, never occupancy.
     source_base: Option<(u64, i128)>,
+    /// Earlier untagged PCM cannot acquire the identity of a later tagged prefix.
+    source_mapped_from: u128,
     cache_start: i128,
     cache_end: i128,
     cache_count: usize,
     mute_history: History,
     mute_fault: bool,
-    plc_positions: Box<[Option<Position>]>,
+    plc_positions: Box<[SampleTiming]>,
     plc_position: usize,
 }
 
@@ -333,7 +426,7 @@ impl Ring {
         plc_positions
             .try_reserve_exact(delay)
             .map_err(|_| CreateError::NoMemory)?;
-        plc_positions.resize(delay, None);
+        plc_positions.resize(delay, SampleTiming::unmapped(0));
         Ok(Self {
             storage,
             capacity,
@@ -383,6 +476,7 @@ impl Ring {
                 primed: false,
                 reset_failed: false,
                 source_base: None,
+                source_mapped_from: 0,
                 cache_start: 0,
                 cache_end: 0,
                 cache_count: 0,
@@ -628,6 +722,12 @@ impl Ring {
 
     /// Render one output sample using the same priming policy as block playout.
     pub(crate) fn consumer_render_sample(&self) -> (f32, bool, bool) {
+        let (sample, timing, failed) = self.consumer_render_sample_timed();
+        (sample, timing.flags & TIMED_REAL != 0, failed)
+    }
+
+    /// The shared PCM/PLC path also returns the metadata of the actual emitted slot.
+    pub(crate) fn consumer_render_sample_timed(&self) -> (f32, SampleTiming, bool) {
         // Only the single consumer accesses the converter, lookahead and PLC.
         let state = unsafe { &mut *self.consumer.get() };
         let finish = self.finish.load(Ordering::Acquire);
@@ -652,15 +752,15 @@ impl Ring {
         }
         if state.mute_fault {
             saturating_add_counter(&self.adapter_error_count, 1);
-            return (0.0, false, true);
+            return (0.0, SampleTiming::unmapped(0), true);
         }
         if state.quiet && self.available() == 0 {
-            return (0.0, false, state.reset_failed);
+            return (0.0, SampleTiming::unmapped(0), state.reset_failed);
         }
         state.quiet = false;
         if !state.primed && !state.reset_failed {
             if self.available() < self.reserve_samples && state.finite.is_none() {
-                return (0.0, false, false);
+                return (0.0, SampleTiming::unmapped(0), false);
             }
             state.primed = true;
         }
@@ -697,14 +797,15 @@ impl Ring {
         }
         if state.mute_fault {
             saturating_add_counter(&self.adapter_error_count, 1);
-            return (0.0, false, true);
+            return (0.0, SampleTiming::unmapped(0), true);
         }
         let failed = matches!(refill, RefillResult::AdapterError);
-        let position = if matches!(refill, RefillResult::Ready) {
-            state.cache_position()
+        let mut timing = if matches!(refill, RefillResult::Ready) {
+            state.cache_timing()
         } else {
-            None
+            SampleTiming::unmapped(0)
         };
+        let position = timing.mute_position();
         let mut input = if matches!(refill, RefillResult::Ready) {
             let sample = state.output[state.output_offset];
             state.output_offset += 1;
@@ -720,10 +821,14 @@ impl Ring {
         // again after PLC so a late interval also reaches its retained lookahead.
         if state.mute_history.muted(position) {
             input = Some(0.0);
+            timing.flags |= TIMED_MUTED;
         }
         self.record_shortfall(input.is_none());
         if failed {
             saturating_add_counter(&self.adapter_error_count, 1);
+        }
+        if input.is_none() && state.plc.is_some() && !state.reset_failed {
+            timing.flags |= TIMED_PLC;
         }
         // Reset failures silence all output; the reset has already cleared PLC.
         let (mut output, real) = if state.reset_failed {
@@ -734,36 +839,42 @@ impl Ring {
                 None => (input.unwrap_or(0.0), input.is_some()),
             }
         };
-        let delayed_position = if state.plc_positions.is_empty() {
-            position
+        let mut delayed_timing = if state.plc_positions.is_empty() {
+            timing
         } else {
             let old = state.plc_positions[state.plc_position];
-            state.plc_positions[state.plc_position] = position;
+            state.plc_positions[state.plc_position] = timing;
             state.plc_position = (state.plc_position + 1) % state.plc_positions.len();
             old
         };
+        let delayed_position = delayed_timing.mute_position();
         if state.mute_history.muted(delayed_position) {
             output = 0.0;
+            delayed_timing.flags |= TIMED_MUTED;
         }
         state.mute_history.retire(delayed_position);
-        (output, real, failed)
+        delayed_timing.flags |= if real { TIMED_REAL } else { 0 };
+        (output, delayed_timing.public(), failed)
     }
 
     /// Play only already retained PLC lookahead, then reset the warmed stream
     /// before releasing producer ownership. Neither padding nor idle is loss.
-    fn drain_finite(&self, state: &mut ConsumerState) -> (f32, bool, bool) {
+    fn drain_finite(&self, state: &mut ConsumerState) -> (f32, SampleTiming, bool) {
         let end = state.finite.as_mut().unwrap();
         let remaining = end.plc_remaining.get_or_insert(state.plc_positions.len());
         if *remaining != 0 {
             *remaining -= 1;
             let (mut output, real) = state.plc.as_mut().unwrap().drain_sample();
-            let position = state.plc_positions[state.plc_position];
+            let mut timing = state.plc_positions[state.plc_position];
+            let position = timing.mute_position();
             state.plc_position = (state.plc_position + 1) % state.plc_positions.len();
             if state.mute_history.muted(position) {
                 output = 0.0;
+                timing.flags |= TIMED_MUTED;
             }
             state.mute_history.retire(position);
-            return (output, real, false);
+            timing.flags |= if real { TIMED_REAL } else { 0 };
+            return (output, timing.public(), false);
         }
         self.complete_finite(state, false)
     }
@@ -774,7 +885,7 @@ impl Ring {
         &self,
         state: &mut ConsumerState,
         adapter_failed: bool,
-    ) -> (f32, bool, bool) {
+    ) -> (f32, SampleTiming, bool) {
         let token = state.finite.as_ref().unwrap().token;
         let failed = state.reset().is_err() || adapter_failed;
         state.quiet = true;
@@ -796,7 +907,7 @@ impl Ring {
         }
         self.finish
             .store((token << 2) | status as u64, Ordering::Release);
-        (0.0, false, failed)
+        (0.0, SampleTiming::unmapped(0), failed)
     }
 
     /// Render a validated native PCM block without callback-size assumptions.
@@ -900,16 +1011,27 @@ impl ConsumerState {
     /// positions. Its fixed ratio within a bounded process call makes this affine;
     /// compensation is reset for that call, not inferred from requested occupancy.
     /// Both neighboring source samples are covered at a fractional boundary.
-    fn cache_position(&self) -> Option<Position> {
-        let (generation, offset) = self.source_base?;
-        let position = self.cache_source_position() + offset * 1_000_000_000;
-        let low = u64::try_from(position.div_euclid(1_000_000_000)).ok()?;
-        let high = u64::try_from((position + 999_999_999).div_euclid(1_000_000_000)).ok()?;
-        Some(Position {
-            generation,
-            low,
-            high,
-        })
+    fn cache_timing(&self) -> SampleTiming {
+        let source = self.cache_source_position();
+        let flags = if self.output_missing { TIMED_GAP } else { 0 }
+            | if source < 0 { TIMED_ZERO_EXTENSION } else { 0 };
+        let Some((generation, offset)) = self.source_base else {
+            return SampleTiming::unmapped(flags);
+        };
+        let Some(position) = offset
+            .checked_mul(1_000_000_000)
+            .and_then(|offset| source.checked_add(offset))
+        else {
+            return SampleTiming::unmapped(flags);
+        };
+        let mut timing = SampleTiming::at(generation, position, flags);
+        if self.source_mapped_from != 0
+            && source.div_euclid(1_000_000_000) < self.source_mapped_from as i128
+            && timing.flags & TIMED_POSITION_VALID != 0
+        {
+            timing.flags = (timing.flags & !TIMED_POSITION_VALID) | TIMED_LEGACY_ONLY;
+        }
+        timing
     }
     /// Discard every ended-burst cache even if the adapter cannot reset.
     /// Conversion stays blocked after failure until a later reset succeeds.
@@ -928,10 +1050,11 @@ impl ConsumerState {
         self.finite = None;
         self.gaps.clear();
         self.source_base = None;
+        self.source_mapped_from = 0;
         self.cache_count = 0;
         self.mute_history.clear();
         self.mute_fault = false;
-        self.plc_positions.fill(None);
+        self.plc_positions.fill(SampleTiming::unmapped(0));
         self.plc_position = 0;
         if let Some(plc) = &mut self.plc {
             plc.reset();
@@ -971,6 +1094,9 @@ impl ConsumerState {
                 break;
             };
             if let Some(stamp) = sample.stamp {
+                if self.source_base.is_none() {
+                    self.source_mapped_from = self.source_taken;
+                }
                 let base = self.source_base.get_or_insert((
                     stamp.generation,
                     i128::from(stamp.source) - self.source_taken as i128,

@@ -113,6 +113,9 @@ type ProducerMute = extern "C" fn(*mut Rpcr3Ring, u64, *const mute::Span, u32, *
 type ProducerFinish = extern "C" fn(*mut Rpcr3Ring, *mut u64) -> c_int;
 /// C function type acquiring the latest finite boundary's outcome.
 type FinishQuery = extern "C" fn(*const Rpcr3Ring, u64, *mut u32) -> c_int;
+/// Compatible timed rendering shares the sole consumer and existing PCM/PLC path.
+type ConsumerRenderTimed =
+    extern "C" fn(*mut Rpcr3Ring, *mut f32, *mut ring::SampleTiming) -> c_int;
 
 /// Versioned C function table exported by the shared object.
 #[repr(C)]
@@ -134,6 +137,7 @@ pub struct Descriptor {
     ring_producer_mute: ProducerMute,
     ring_producer_finish: ProducerFinish,
     ring_finish_status: FinishQuery,
+    ring_consumer_render_sample_timed: ConsumerRenderTimed,
 }
 
 // The descriptor contains immutable data and function pointers valid for the
@@ -452,6 +456,36 @@ extern "C" fn ring_consumer_render_sample(
     }
 }
 
+/// Validate the sized result before consuming exactly one shared-path output sample.
+extern "C" fn ring_consumer_render_sample_timed(
+    ring: *mut Rpcr3Ring,
+    sample: *mut f32,
+    timing: *mut ring::SampleTiming,
+) -> c_int {
+    let (Some(sample), Some(timing), Ok(handle)) =
+        (NonNull::new(sample), NonNull::new(timing), unsafe {
+            checked_ring(ring)
+        })
+    else {
+        return RESULT_INVALID_ARGUMENT;
+    };
+    if unsafe { ptr::addr_of!((*timing.as_ptr()).struct_size).read() }
+        < size_of::<ring::SampleTiming>() as u32
+    {
+        return RESULT_INVALID_ARGUMENT;
+    }
+    let (pcm, metadata, failed) = handle.ring.consumer_render_sample_timed();
+    unsafe {
+        sample.as_ptr().write(pcm);
+        timing.as_ptr().write(metadata);
+    }
+    if failed {
+        RESULT_ADAPTER_ERROR
+    } else {
+        RESULT_OK
+    }
+}
+
 /// Render a variable-size output block without a fixed callback-duration assumption.
 extern "C" fn ring_consumer_render(
     ring: *mut Rpcr3Ring,
@@ -592,6 +626,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     ring_producer_mute,
     ring_producer_finish,
     ring_finish_status,
+    ring_consumer_render_sample_timed,
 };
 
 /// Return the immutable ABI-major-3 descriptor for the Rust ring.

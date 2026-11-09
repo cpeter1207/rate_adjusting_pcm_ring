@@ -22,7 +22,7 @@ CPPHECK_EXHAUSTIVE := $(shell $(CPPCHECK) --help 2>&1 | grep -q -- '--check-leve
 
 PACKAGE := rate-adjusting-pcm-ring
 CRATE := rate_adjusting_pcm_ring3
-PACKAGE_VERSION ?= 3.0.0-alpha.4
+PACKAGE_VERSION ?= 3.0.0-alpha.5
 SOVERSION := 3
 PREFIX ?= /usr/local
 DESTDIR ?=
@@ -44,6 +44,7 @@ PC_FILE := build/rate_adjusting_pcm_ring3.pc
 C_SMOKE_SOURCE := tests/descriptor_smoke.c
 C_SMOKE_BINARY := build/descriptor-smoke
 C_INTEGRATION_SOURCE := tests/plc_integration.c
+C_ALLOCATION_GUARD := tests/allocation_guard.c
 C_INTEGRATION_BINARY := build/plc-integration
 DEBIAN_VERSION = $(shell dpkg-parsechangelog -S Version)
 DEBIAN_ARCH = $(shell dpkg-architecture -qDEB_HOST_ARCH)
@@ -106,15 +107,15 @@ quality: lint static-analysis docs
 
 lint:
 	$(CARGO_FMT) --check
-	$(CLANG_FORMAT) --dry-run --Werror $(HEADER) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE)
+	$(CLANG_FORMAT) --dry-run --Werror $(HEADER) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE) $(C_ALLOCATION_GUARD)
 	$(SHELLCHECK) tools/run-in-quality-container.sh debian/tests/install-check
 
 static-analysis:
 	RUSTFLAGS="-L native=$(SAMPLERATE_ADAPTER_LIBDIR)" $(CARGO_CLIPPY) --all-targets --all-features -- -D warnings
 	$(PYTHON) -m py_compile $(RUST_DOXYGEN_GENERATOR)
 	$(CPPCHECK) $(CPPHECK_EXHAUSTIVE) --force --enable=warning,style,performance,portability \
-		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE)
-	$(CLANG_TIDY) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE) --warnings-as-errors='*' -- $(C_WARNINGS) -Iinclude
+		--error-exitcode=1 --std=c11 -Iinclude $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE) $(C_ALLOCATION_GUARD)
+	$(CLANG_TIDY) $(C_SMOKE_SOURCE) $(C_INTEGRATION_SOURCE) $(C_ALLOCATION_GUARD) --warnings-as-errors='*' -- $(C_WARNINGS) -Iinclude
 
 docs: | build
 	rm -rf $(RUST_DOXYGEN_INPUT)
@@ -131,8 +132,8 @@ test: all
 	$(MAKE) $(C_INTEGRATION_BINARY)
 	LD_LIBRARY_PATH="$(CURDIR)/build:$(SAMPLERATE_ADAPTER_LIBDIR):$$LD_LIBRARY_PATH" ./$(C_INTEGRATION_BINARY)
 
-$(C_INTEGRATION_BINARY): $(C_INTEGRATION_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
-	$(CC) $(C_WARNINGS) -Iinclude $< -Lbuild -L$(SAMPLERATE_ADAPTER_LIBDIR) \
+$(C_INTEGRATION_BINARY): $(C_INTEGRATION_SOURCE) $(C_ALLOCATION_GUARD) $(HEADER) $(LIBRARY_LINK) | build
+	$(CC) $(C_WARNINGS) -Iinclude $(C_INTEGRATION_SOURCE) $(C_ALLOCATION_GUARD) -Lbuild -L$(SAMPLERATE_ADAPTER_LIBDIR) \
 		-l$(CRATE) -Wl,-rpath,'$$ORIGIN' \
 		-Wl,-rpath-link,$(SAMPLERATE_ADAPTER_LIBDIR) -o $@
 

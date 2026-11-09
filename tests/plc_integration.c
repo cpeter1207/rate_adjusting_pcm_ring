@@ -10,6 +10,8 @@
 #include "rate_adjusting_pcm_ring3/rate_adjusting_pcm_ring3.h"
 
 static const struct rpcr3_descriptor *api;
+extern void ring_test_realtime_begin(void);
+extern void ring_test_realtime_end(void);
 
 /** Publish constant PCM in calls respecting the immutable producer bound. */
 static void supply(struct rpcr3_ring *ring, uint64_t count, uint64_t maximum) {
@@ -136,9 +138,68 @@ static void drift(int ppm) {
   api->ring_destroy(ring);
 }
 
+/** Timed metadata follows native SRC/PLC without callback allocations or stale
+ * tags. */
+static void timed_rendering(void) {
+  struct rpcr3_config c = {.struct_size = sizeof(c),
+                           .abi_version = RPCR3_ABI_VERSION,
+                           .capacity_samples = 2048,
+                           .input_rate_hz = 8000,
+                           .output_rate_hz = 48000,
+                           .reserve_samples = 700,
+                           .target_samples = 1000,
+                           .max_producer_samples = 640,
+                           .max_output_samples = 32,
+                           .plc_mode = RPCR3_PLC_G711_APPENDIX_I};
+  struct rpcr3_ring *ring = NULL;
+  assert(api->ring_create(&c, &ring) == RPCR3_OK);
+  float source[512];
+  for (unsigned i = 0; i < 512; ++i)
+    source[i] = 0.25F;
+  uint64_t accepted = 0, token = 0;
+  assert(api->ring_producer_push_tagged(ring, source, 512, 1, 0, NULL, 0,
+                                        &accepted) == RPCR3_OK &&
+         accepted == 512);
+  assert(api->ring_producer_gap(ring, 16, &accepted) == RPCR3_OK &&
+         accepted == 16);
+  assert(api->ring_producer_push_tagged(ring, source, 512, 1, 528, NULL, 0,
+                                        &accepted) == RPCR3_OK &&
+         accepted == 512);
+  assert(api->ring_producer_finish(ring, &token) == RPCR3_OK);
+  bool gap = false, plc = false, negative = false, muted = false;
+  uint32_t status = RPCR3_FINISH_PENDING;
+  ring_test_realtime_begin();
+  for (unsigned count = 0; status == RPCR3_FINISH_PENDING; ++count) {
+    assert(count < 8000);
+    if (count == 100) {
+      const struct rpcr3_mute_span span = {.start = 10, .end = 30};
+      uint32_t credit = 0;
+      assert(api->ring_producer_mute(ring, 1, &span, 1, &credit) == RPCR3_OK &&
+             credit == 1);
+    }
+    struct rpcr3_timed_sample_v1 timing = {.struct_size = sizeof(timing)};
+    float sample = 0.0F;
+    assert(api->ring_consumer_render_sample_timed(ring, &sample, &timing) ==
+           RPCR3_OK);
+    assert(isfinite(sample));
+    gap |= (timing.flags & RPCR3_TIMED_GAP) != 0;
+    plc |= (timing.flags & RPCR3_TIMED_PLC) != 0;
+    negative |= (timing.flags & RPCR3_TIMED_NEGATIVE) != 0;
+    muted |= (timing.flags & RPCR3_TIMED_MUTED) != 0;
+    if (timing.flags & RPCR3_TIMED_POSITION_VALID)
+      assert(timing.generation == 1 && timing.source_frame < 1040);
+    assert(api->ring_finish_status(ring, token, &status) == RPCR3_OK);
+  }
+  assert(api->ring_consumer_reset(ring) == RPCR3_OK);
+  ring_test_realtime_end();
+  assert(gap && plc && negative && muted);
+  api->ring_destroy(ring);
+}
+
 int main(void) {
   api = rpcr3_descriptor();
   assert(api && api->abi_version == RPCR3_ABI_VERSION);
+  timed_rendering();
   callers();
   drift(-100);
   drift(100);

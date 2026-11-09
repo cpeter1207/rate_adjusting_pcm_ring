@@ -43,6 +43,35 @@ struct rpcr3_mute_span {
   uint64_t end;   /**< First following sample not in this interval. */
 };
 
+/** A source coordinate is available; generation zero is valid. */
+#define RPCR3_TIMED_POSITION_VALID 1U
+/** The valid coordinate is negative; zero is never negative. */
+#define RPCR3_TIMED_NEGATIVE 2U
+/** Existing real-PCM classification, including PLC recovery blends. */
+#define RPCR3_TIMED_REAL 4U
+/** This delayed output slot requested PLC, rather than new source PCM. */
+#define RPCR3_TIMED_PLC 8U
+/** The source slot belongs to a producer-published missing interval. */
+#define RPCR3_TIMED_GAP 16U
+/** Intentional source muting applies to this output. */
+#define RPCR3_TIMED_MUTED 32U
+/** Startup FIR zero extension precedes the first admitted source sample. */
+#define RPCR3_TIMED_ZERO_EXTENSION 64U
+
+/** Original source position and classification of one actual emitted output. */
+struct rpcr3_timed_sample_v1 {
+  uint32_t struct_size; /**< Caller sets available size; result sets this prefix
+                           size. */
+  uint32_t flags; /**< RPCR3_TIMED_* flags; no VALID means no source age may be
+                     assigned. */
+  uint64_t generation; /**< Original producer generation; zero is valid. */
+  uint64_t
+      source_frame; /**< Whole source frames in the coordinate magnitude. */
+  uint32_t source_fraction_billionths; /**< Magnitude fraction, below
+                                          1,000,000,000. */
+  uint32_t reserved;                   /**< Zero. */
+};
+
 /** @brief Result returned by a descriptor operation. */
 enum rpcr3_result {
   /** Operation completed successfully. */
@@ -393,7 +422,53 @@ struct rpcr3_descriptor {
    */
   enum rpcr3_result (*ring_finish_status)(const struct rpcr3_ring *ring,
                                           uint64_t token, uint32_t *status);
+  /**
+   * @brief Render one sample and its original delayed source coordinate.
+   * @param ring Ring with exactly one active consumer.
+   * @param sample Destination for one output, sharing the ordinary PCM/PLC
+   * path.
+   * @param timing Caller-sized result; check its size before any consumption.
+   * @return RPCR3_OK, RPCR3_ADAPTER_ERROR after writing the ordinary rendered
+   * sample/result, or RPCR3_INVALID_ARGUMENT without consuming or changing
+   * outputs.
+   *
+   * With POSITION_VALID, the source position is sign times (source_frame +
+   * source_fraction_billionths/1e9), where NEGATIVE supplies sign. This retains
+   * full unsigned 64-bit source indices and negative startup without
+   * multiplying a long-lived index into an int64 nanoframe counter. Coordinates
+   * use the same measured pre/post-conversion cache mapping as source muting.
+   * Metadata follows the existing PLC delay, finite drainage, generation fences
+   * and resets.
+   *
+   * REAL matches the existing real boolean; ZERO_EXTENSION separately
+   * identifies startup history without admitted source. GAP identifies a mapped
+   * missing source slot; PLC identifies synthesis for that slot or an unmapped
+   * shortfall, not the provenance of its historical waveform. Recovery blends
+   * remain REAL. Muting a gap before PLC admission replaces its PLC request
+   * with intentional real silence: GAP | MUTED | REAL, without PLC. A later
+   * mute of a gap already retained in PLC lookahead adds MUTED and gates output
+   * to zero while retaining GAP | PLC and REAL=false. Muted real PCM stays REAL
+   * and gains MUTED. Initial PLC delay,
+   * idle and an untagged prefix are unmapped. Position fields are zero when
+   * unmapped; later tagging never assigns an identity to an earlier untagged
+   * prefix.
+   *
+   * No wall clock or admission time is invented here. Callers retain bounded
+   * admission anchors keyed by generation and actually accepted source
+   * prefixes. Larger result records retain their trailing bytes. All operations
+   * remain allocation-free and lock-free; timed and ordinary calls share one
+   * consumer.
+   * @note Compatible ABI3 tail; check RPCR3_DESCRIPTOR_TIMED_MIN_SIZE first.
+   */
+  enum rpcr3_result (*ring_consumer_render_sample_timed)(
+      struct rpcr3_ring *ring, float *sample,
+      struct rpcr3_timed_sample_v1 *timing);
 };
+
+/** Readable prefix required before using original source-position rendering. */
+#define RPCR3_DESCRIPTOR_TIMED_MIN_SIZE                                        \
+  (offsetof(struct rpcr3_descriptor, ring_consumer_render_sample_timed) +      \
+   sizeof(((struct rpcr3_descriptor *)0)->ring_consumer_render_sample_timed))
 
 /** Readable prefix required before finite-source completion operations. */
 #define RPCR3_DESCRIPTOR_FINISH_MIN_SIZE                                       \

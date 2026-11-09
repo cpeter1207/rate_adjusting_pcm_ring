@@ -296,7 +296,7 @@ fn coverage_prepared_mute_and_plc_workspace_allocation_failures() {
     for bytes in [
         1026 * size_of::<crate::mute::Interval>(),
         mute::MAX_SPANS * 2 * size_of::<crate::mute::Interval>(),
-        30 * size_of::<Option<Position>>(),
+        30 * size_of::<SampleTiming>(),
     ] {
         let result = crate::tests::fail_allocation_at(bytes, 1, || {
             Ring::create(
@@ -399,15 +399,99 @@ fn coverage_source_support_rejects_fractional_u64_overflow() {
     state.cache_count = 1;
     state.cache_start = i128::from(u64::MAX) * 1_000_000_000 + 1;
     state.cache_end = state.cache_start;
-    assert!(state.cache_position().is_none());
+    assert!(state.cache_timing().mute_position().is_none());
     state.cache_start = 0;
     state.cache_end = 0;
     assert_eq!(
         state
-            .cache_position()
+            .cache_timing()
+            .mute_position()
             .map(|p| (p.generation, p.low, p.high)),
         Some((1, 0, 0))
     );
+}
+
+#[test]
+fn timed_signed_magnitude_handles_negative_fraction_and_full_u64_indices() {
+    for (position, frame, fraction, flags) in [
+        (
+            -1_250_000_000_i128,
+            1,
+            250_000_000,
+            TIMED_POSITION_VALID | TIMED_NEGATIVE,
+        ),
+        (0, 0, 0, TIMED_POSITION_VALID),
+        (
+            i128::from(u64::MAX) * 1_000_000_000 + 999_999_999,
+            u64::MAX,
+            999_999_999,
+            TIMED_POSITION_VALID,
+        ),
+        (i128::MIN, 0, 0, 0),
+    ] {
+        let timing = SampleTiming::at(0, position, 0);
+        assert_eq!(
+            (
+                timing.source_frame,
+                timing.source_fraction_billionths,
+                timing.flags
+            ),
+            (frame, fraction, flags)
+        );
+        assert_eq!(timing.reserved, 0);
+    }
+    let ring = ring(512);
+    let state = unsafe { &mut *ring.consumer.get() };
+    state.cache_count = 1;
+    for (offset, source) in [(i128::MAX, 0), (1, i128::MAX)] {
+        state.source_base = Some((1, offset));
+        state.cache_start = source;
+        state.cache_end = source;
+        assert_eq!(state.cache_timing().flags & TIMED_POSITION_VALID, 0);
+    }
+    state.source_mapped_from = 1;
+    state.source_base = Some((1, i128::from(u64::MAX) + 1));
+    state.cache_start = 0;
+    state.cache_end = 0;
+    assert_eq!(state.cache_timing().public(), SampleTiming::unmapped(0));
+}
+
+#[test]
+fn timed_failed_reset_cannot_label_silence_as_new_plc_or_source_pcm() {
+    static FAIL_RESET: AtomicBool = AtomicBool::new(false);
+    unsafe extern "C" fn reset(_converter: *mut c_void) -> c_int {
+        if FAIL_RESET.swap(false, Ordering::Relaxed) {
+            -1
+        } else {
+            0
+        }
+    }
+    let descriptor = AdapterDescriptor {
+        converter_reset: Some(reset),
+        ..FAKE_DESCRIPTOR
+    };
+    let ring = Ring::create(
+        Settings {
+            reserve: 32,
+            target: 32,
+            max_producer: 32,
+            max_output: 1,
+            plc: PlcMode::G711AppendixI,
+            ..crate::tests::settings(512, 8000, 8000)
+        },
+        unsafe { AdapterFunctions::from_descriptor(&descriptor) }.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ring.producer_push_tagged(&[0.5; 32], 9, 0, &[]), Ok(32));
+    for _ in 0..31 {
+        assert!(!ring.consumer_render_sample_timed().2);
+    }
+    FAIL_RESET.store(true, Ordering::Relaxed);
+    assert_eq!(ring.consumer_reset(), Err(()));
+    let (sample, timing, failed) = ring.consumer_render_sample_timed();
+    assert!(failed);
+    assert_eq!((sample, timing.flags, timing.source_frame), (0.0, 0, 0));
+    assert_eq!(ring.consumer_reset(), Ok(()));
 }
 
 #[test]
@@ -559,7 +643,7 @@ fn real_gap_mapping_survives_partial_adapter_input_wrap_and_ppm_changes() {
                     assert!(if is_gap {
                         ring.producer_gap(1) == 1
                     } else {
-                        ring.producer_push_sample(0.5)
+                        ring.producer_push_tagged(&[0.5], 1, source, &[]) == Ok(1)
                     });
                     source += 1;
                 }
@@ -569,11 +653,15 @@ fn real_gap_mapping_survives_partial_adapter_input_wrap_and_ppm_changes() {
                     saw_pending |= state.input_pending != 0;
                     saw_converter_backlog |= state.converter.queued_input().unwrap() != 0;
                 }
-                let (_, real, failed) = ring.consumer_render_sample();
+                let (_, timing, failed) = ring.consumer_render_sample_timed();
+                let real = timing.flags & TIMED_REAL != 0;
                 assert!(
                     !failed,
                     "rate={rate}, correction={correction}, output={index}"
                 );
+                assert_eq!(timing.flags & TIMED_POSITION_VALID, TIMED_POSITION_VALID);
+                assert_eq!(timing.generation, 1);
+                assert_eq!(timing.flags & TIMED_GAP != 0, !real);
                 missing += usize::from(!real);
             }
             let expected = 162.0 * nominal * correction;
