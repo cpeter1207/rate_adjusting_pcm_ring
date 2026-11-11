@@ -136,7 +136,8 @@ struct rpcr3_config {
   uint32_t struct_size;
   /** Required descriptor ABI version. */
   uint32_t abi_version;
-  /** Fixed SPSC storage and conversion-workspace size in input samples, from
+  /** Fixed SPSC storage size in input samples (DSP workspaces are bounded
+   * independently), from
    * @ref RPCR3_MINIMUM_CAPACITY_SAMPLES through
    * @ref RPCR3_MAXIMUM_CAPACITY_SAMPLES. */
   uint64_t capacity_samples;

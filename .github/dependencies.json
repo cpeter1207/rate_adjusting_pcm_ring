@@ -1,7 +1,7 @@
 [
   {
     "repository": "rptadv-samplerate-adapter",
-    "sha": "55e09c0152afd44aa6cae164006186172bd06249",
+    "sha": "7c2081290fbaa6b23d8a46270b4a4797b7c94477",
     "packages": ["librptadv-samplerate-adapter2", "librptadv-samplerate-adapter-dev"]
   }
 ]

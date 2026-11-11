@@ -280,7 +280,7 @@ fn failed_finite_conversion_discards_the_whole_old_burst_before_reuse() {
 
 #[test]
 fn tagged_source_and_gap_metadata_allocation_failures_are_recoverable() {
-    for bytes in [512 * size_of::<SourceSample>(), 1026 * size_of::<GapSpan>()] {
+    for bytes in [512 * size_of::<StoredSample>(), 1026 * size_of::<GapSpan>()] {
         let result = crate::tests::fail_allocation_at(bytes, 1, || {
             Ring::create(
                 crate::tests::settings(512, 8000, 8000),
@@ -752,4 +752,81 @@ fn failed_reset_silences_cached_and_new_pcm_until_successful_reset() {
     assert_eq!(ring.producer_push(&[0.3]), 1);
     assert_eq!(ring.consumer_render(&mut output), (1, false));
     assert_eq!(output, [0.2]);
+}
+
+#[test]
+fn large_fifo_keeps_conversion_workspaces_bounded() {
+    let ring = ring(16576);
+    let state = unsafe { &*ring.consumer.get() };
+    assert_eq!(state.input.len(), 512);
+    assert_eq!(state.output.len(), 256);
+    assert!(std::mem::size_of_val(unsafe { &*ring.storage[0].get() }) <= 24);
+    assert_eq!(ring.producer_push(&vec![0.25; 16576]), 16576);
+}
+
+#[test]
+fn compact_storage_preserves_full_width_tags_and_pcm() {
+    for stamp in [
+        None,
+        Some(Stamp {
+            generation: 0,
+            source: 0,
+        }),
+        Some(Stamp {
+            generation: u64::MAX,
+            source: u64::MAX,
+        }),
+    ] {
+        for missing in [false, true] {
+            for pcm in [-1.0_f32, -0.0, 0.25, 1.0] {
+                let sample = SourceSample {
+                    pcm,
+                    missing,
+                    stamp,
+                };
+                let restored = SourceSample::from(StoredSample::from(sample));
+                assert_eq!(restored, sample);
+                assert_eq!(restored.pcm.to_bits(), sample.pcm.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
+fn large_fifo_drains_alternating_gaps_through_bounded_real_converter() {
+    for (input_rate, output_rate) in [(8000, 48000), (48000, 48000), (48000, 8000)] {
+        for correction in [0.999, 1.0, 1.001] {
+            let ring = Ring::create(
+                crate::tests::settings(16576, input_rate, output_rate),
+                crate::samplerate_adapter::load_functions().unwrap(),
+            )
+            .unwrap();
+            for source in 0..16576 {
+                if source % 2 == 0 {
+                    assert_eq!(ring.producer_push_tagged(&[0.25], 0, source, &[]), Ok(1));
+                } else {
+                    assert_eq!(ring.producer_gap(1), 1);
+                }
+            }
+            let token = ring.producer_finish().unwrap();
+            unsafe {
+                (*ring.consumer.get()).ratio =
+                    f64::from(output_rate) / f64::from(input_rate) * correction;
+            }
+            let mut played = 0;
+            while ring.finish_status(token) == Ok(FinishStatus::Pending) {
+                assert!(played < 101000, "finite source did not drain");
+                let (_, _, failed) = ring.consumer_render_sample_timed();
+                assert!(
+                    !failed,
+                    "{input_rate}->{output_rate}, {correction}, {played}"
+                );
+                played += 1;
+            }
+            assert_eq!(ring.finish_status(token), Ok(FinishStatus::Drained));
+            assert_eq!(ring.available(), 0);
+            assert_eq!(ring.observe().adapter_error_count, 0);
+            assert!(played > 16576 * output_rate as usize / input_rate as usize / 2);
+        }
+    }
 }
