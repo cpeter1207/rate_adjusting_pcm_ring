@@ -1,3 +1,11 @@
+rate-adjusting-pcm-ring (3.0.0~alpha6-1) unstable; urgency=medium
+
+  * Bound converter workspaces independently of jitter FIFO capacity.
+  * Compact source-tagged sample storage without changing ABI3 or FIFO limits.
+  * Preserve allocation-free audio and test large-FIFO gap/drift drainage.
+
+ -- codex <codex@localhost>  Wed, 11 Nov 2026 18:53:05 -0000
+
 rate-adjusting-pcm-ring (3.0.0~alpha5-1) unstable; urgency=medium
 
   * Expose sized source timing and provenance on consumer output.

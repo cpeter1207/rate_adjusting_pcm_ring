@@ -209,3 +209,13 @@ publish those trees as documentation artifacts; this source repository
 deliberately contains no host-specific publication command.
 
 The project is licensed under [GPL-2.0-only](COPYING).
+
+## Prepared memory
+
+FIFO capacity retains its configured jitter duration and source tags. Conversion
+uses a separate 512-frame input workspace and 256-frame output quantum, so a
+large FIFO does not enlarge the samplerate adapter's warmed DSP buffers. A
+converter that makes no progress after a complete 512-frame prefix reports an
+adapter error. Source tags retain all 64 bits of generation and position in
+compact 24-byte slots. All storage is still prepared before audio; the public
+ABI and FIFO admission bounds are unchanged.

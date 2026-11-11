@@ -22,7 +22,7 @@ CPPHECK_EXHAUSTIVE := $(shell $(CPPCHECK) --help 2>&1 | grep -q -- '--check-leve
 
 PACKAGE := rate-adjusting-pcm-ring
 CRATE := rate_adjusting_pcm_ring3
-PACKAGE_VERSION ?= 3.0.0-alpha.5
+PACKAGE_VERSION ?= 3.0.0-alpha.6
 SOVERSION := 3
 PREFIX ?= /usr/local
 DESTDIR ?=

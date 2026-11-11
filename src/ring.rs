@@ -15,7 +15,10 @@ use crate::samplerate_adapter::{AdapterFunctions, Converter};
 
 /// Maximum input/output chunk handed to the persistent converter per refill.
 const CONVERTER_QUANTUM: usize = 256;
-/// Smallest workspace that can grow once after a zero-progress SRC call.
+/// Two quanta allow a stalled conversion to accumulate another bounded prefix.
+/// Jitter FIFO duration must not multiply the adapter's warmed DSP storage.
+const CONVERTER_INPUT_CAPACITY: usize = CONVERTER_QUANTUM * 2;
+/// Smallest FIFO, retaining two conversion quanta of producer headroom.
 pub(crate) const MINIMUM_CAPACITY: usize = CONVERTER_QUANTUM * 2;
 /// Largest source workspace accepted by the adapter's `uint32_t` ABI.
 pub(crate) const MAXIMUM_CAPACITY: usize = u32::MAX as usize;
@@ -178,6 +181,40 @@ struct SourceSample {
     stamp: Option<Stamp>,
 }
 
+/// Compact SPSC payload: explicit tag presence shares scalar padding instead
+/// of adding an eight-byte Option discriminant to every buffered sample.
+#[derive(Clone, Copy)]
+struct StoredSample {
+    stamp: Stamp,
+    pcm: f32,
+    missing: bool,
+    tagged: bool,
+}
+impl From<SourceSample> for StoredSample {
+    /// Preserve full source identity without an Option discriminant per slot.
+    fn from(sample: SourceSample) -> Self {
+        Self {
+            stamp: sample.stamp.unwrap_or(Stamp {
+                generation: 0,
+                source: 0,
+            }),
+            pcm: sample.pcm,
+            missing: sample.missing,
+            tagged: sample.stamp.is_some(),
+        }
+    }
+}
+impl From<StoredSample> for SourceSample {
+    /// Restore optional identity after acquiring the published payload.
+    fn from(sample: StoredSample) -> Self {
+        Self {
+            pcm: sample.pcm,
+            missing: sample.missing,
+            stamp: sample.tagged.then_some(sample.stamp),
+        }
+    }
+}
+
 /// Half-open missing interval on the consumer's accepted source timeline.
 struct GapSpan {
     start: u128,
@@ -316,7 +353,7 @@ struct ConsumerState {
 
 /// All preallocated payload and consumer workspaces owned by one ring.
 struct Workspaces {
-    storage: Box<[UnsafeCell<SourceSample>]>,
+    storage: Box<[UnsafeCell<StoredSample>]>,
     input: Box<[f32]>,
     output: Box<[f32]>,
 }
@@ -331,7 +368,7 @@ struct Workspaces {
 /// empty and their storage indices stay aligned across every wrap. Release
 /// publication and acquire consumption preserve the SPSC payload ordering.
 pub(crate) struct Ring {
-    storage: Box<[UnsafeCell<SourceSample>]>,
+    storage: Box<[UnsafeCell<StoredSample>]>,
     capacity: usize,
     capacity_u64: u64,
     written: AtomicU64,
@@ -400,19 +437,19 @@ impl Ring {
         let mut converter = match adapter.create_converter(
             input_rate_hz,
             output_rate_hz,
-            capacity as u32,
+            CONVERTER_INPUT_CAPACITY as u32,
             CONVERTER_QUANTUM as u32,
         ) {
             Ok(converter) => converter,
             Err(()) => return Err(CreateError::Adapter),
         };
-        // At most capacity input-workspace slots plus capacity adapter backlog
+        // At most the bounded input workspace plus bounded adapter backlog
         // and FIR history can retain gap markers. Even alternating one-frame
         // spans fit this conservative bound without runtime growth.
         let delay = converter.input_delay().map_err(|()| CreateError::Adapter)? as u64;
         let history = delay.div_ceil(1_000_000_000) as usize;
         let mut gaps = VecDeque::new();
-        gaps.try_reserve_exact(capacity * 2 + history + 2)
+        gaps.try_reserve_exact(CONVERTER_INPUT_CAPACITY * 2 + history + 2)
             .map_err(|_| CreateError::NoMemory)?;
         let mute_history =
             History::new(capacity * 2 + history + 2).map_err(|_| CreateError::NoMemory)?;
@@ -523,7 +560,7 @@ impl Ring {
         // The producer owns this slot until the release store below publishes
         // it.  The sole consumer acquires `written` before reading it.
         unsafe {
-            *self.storage[index].get() = sample;
+            *self.storage[index].get() = sample.into();
         }
         self.written
             .store((written + 1) % (self.capacity_u64 * 2), Ordering::Release);
@@ -699,7 +736,7 @@ impl Ring {
         let index = (read % self.capacity_u64) as usize;
         // The producer's release publication above makes this slot readable;
         // the consumer alone advances `read`, so no second consumer can race.
-        let sample = unsafe { *self.storage[index].get() };
+        let sample = unsafe { *self.storage[index].get() }.into();
         self.read
             .store((read + 1) % (self.capacity_u64 * 2), Ordering::Release);
         Some(sample)
@@ -1078,13 +1115,13 @@ impl ConsumerState {
         let desired_input = if self.zero_progress {
             self.input_pending
                 .saturating_add(quantum)
-                .min(ring.capacity)
+                .min(self.input.len())
         } else {
             quantum
         };
         self.make_input_space(
             desired_input.saturating_sub(self.input_pending),
-            ring.capacity,
+            self.input.len(),
         );
         while self.input_pending < desired_input {
             if self.input_padding {
@@ -1247,7 +1284,7 @@ impl ConsumerState {
             return RefillResult::Ready;
         }
         self.zero_progress = input_used == 0;
-        if self.zero_progress && self.input_pending == ring.capacity {
+        if self.zero_progress && self.input_pending == self.input.len() {
             return RefillResult::AdapterError;
         }
         RefillResult::Starved
@@ -1284,22 +1321,26 @@ pub(crate) fn allocate_samples(length: usize) -> Result<Box<[f32]>, ()> {
 fn allocate_workspaces(capacity: usize) -> Result<Workspaces, ()> {
     Ok(Workspaces {
         storage: allocate_storage(capacity)?,
-        input: allocate_samples(capacity)?,
-        output: allocate_samples(capacity)?,
+        input: allocate_samples(CONVERTER_INPUT_CAPACITY)?,
+        output: allocate_samples(CONVERTER_QUANTUM)?,
     })
 }
 
 /// Allocate the SPSC payload cells outside real-time processing.
-fn allocate_storage(length: usize) -> Result<Box<[UnsafeCell<SourceSample>]>, ()> {
+fn allocate_storage(length: usize) -> Result<Box<[UnsafeCell<StoredSample>]>, ()> {
     let mut storage = Vec::new();
     if storage.try_reserve_exact(length).is_err() {
         return Err(());
     }
     storage.resize_with(length, || {
-        UnsafeCell::new(SourceSample {
+        UnsafeCell::new(StoredSample {
             pcm: 0.0,
             missing: false,
-            stamp: None,
+            stamp: Stamp {
+                generation: 0,
+                source: 0,
+            },
+            tagged: false,
         })
     });
     Ok(storage.into_boxed_slice())

@@ -2037,8 +2037,8 @@ fn construction_handles_control_plane_allocation_failure_without_panicking() {
     assert!(matches!(too_large, Err(CreateError::Invalid)));
     assert!(allocate_samples(usize::MAX).is_err());
 
-    for occurrence in 1..=2 {
-        let no_memory = fail_allocation_at(512 * size_of::<f32>(), occurrence, || {
+    for length in [512, 256] {
+        let no_memory = fail_allocation(length * size_of::<f32>(), || {
             Ring::create(settings(512, 8_000, 8_000), adapter(&FAKE_DESCRIPTOR))
         });
         assert!(matches!(no_memory, Err(CreateError::NoMemory)));
@@ -2410,7 +2410,7 @@ fn ring_supplies_nominal_rates_and_internal_workspace_bounds() {
         max_output: u32,
         handle: *mut *mut c_void,
     ) -> c_int {
-        if (input_rate, output_rate, max_input, max_output) != (8000, 48000, 640, 256) {
+        if (input_rate, output_rate, max_input, max_output) != (8000, 48000, 512, 256) {
             return ERROR;
         }
         unsafe { fake_create(input_rate, output_rate, max_input, max_output, handle) }
